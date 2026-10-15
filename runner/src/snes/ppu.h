@@ -590,13 +590,18 @@ void ppu_set_vram_write_log_hook(PpuVramWriteLogHook hook);
 /* Raster journal — per-line replay of mid-field PPU register writes for
  * frame-model hosts. See the block comment in ppu.c. The beam cuts it into
  * fields at V=225 (ppu_rasterFieldBoundary); ppu_write records every display
- * register write with the beam line. A host arms it with ppu_rasterBegin and
+ * register write with the beam line, plus decoded OAM/VRAM/CGRAM commits.
+ * A host arms it with ppu_rasterBegin and
  * brackets its render loop with RenderBegin / ApplyLine per line / RenderEnd. */
 void ppu_rasterBegin(Ppu *ppu);
 void ppu_rasterRenderBegin(Ppu *ppu);
 void ppu_rasterRenderEnd(Ppu *ppu);
 int  ppu_rasterTakeHdmaen(uint8_t *out);
 void ppu_rasterRecord(uint16_t reg, uint16_t line, uint8_t val);
+/* Record a committed VRAM word (physical index after address remapping).
+ * Required for paths that write memory directly instead of using ppu_write.
+ * No upload payload is exported by the raster debug dump. */
+void ppu_rasterRecordVram(Ppu *ppu, uint16_t address, uint16_t value);
 void ppu_rasterApplyLine(Ppu *ppu, int line);
 /* Called by the beam walk when it reaches V=225. */
 void ppu_rasterFieldBoundary(void);
@@ -606,7 +611,8 @@ void ppu_rasterReset(void);
  * 1=field boundary. Includes bulk ports; never exports memory contents. */
 typedef void (*PpuDisplayObserver)(int event, uint16_t reg, uint8_t val);
 void ppu_set_display_observer(PpuDisplayObserver observer);
-/* Read-only bounded register metadata. State bytes: INIDISP, TM, TS, CGADSUB,
+/* Read-only bounded journal metadata. Counts/drops/cursor include the bulk
+ * memory log; upload payloads are not exported. State bytes: INIDISP, TM, TS, CGADSUB,
  * CGWSEL. Slots are physical journal slots; current is the recording slot.
  * Probe stages: 1/2=boundary-before/after, 3/4=render-begin-before/after,
  * 5/6=render-end-before/after. Independent of PpuDisplayObserver. */

@@ -3167,8 +3167,9 @@ uint8_t ppu_read(Ppu* ppu, uint8_t adr) {
  * the completed field still needs the old object coordinates. Keep its start
  * image and journal committed words/high-table bytes, not raw port bytes.
  * Decoded commits also account for reads or vblank relatching the OAM port.
- * VRAM/CGRAM uploads retain their existing behavior; this is not a full PPU
- * memory timeline or sub-scanline object evaluation model.
+ * VRAM and CGRAM have their own bounded commit log, so the object table does
+ * not reference the following pose's artwork or palette. Uploads during the
+ * visible field still take effect by line; this is not sub-scanline timing.
  *
  * Writes the render walk makes itself (its HDMA, and this replay) are not
  * journaled: they are the field being reconstructed, not new history. HDMA
@@ -3191,6 +3192,10 @@ void ppu_set_vram_write_log_hook(PpuVramWriteLogHook hook) {
 }
 
 #define PPU_RASTER_MAX 4096
+/* Keep bulk uploads out of the small register/OAM budget. One complete VRAM
+ * upload is 65536 byte writes; overflow is reported, never allocated during
+ * an upload. Baselines plus both logs use approximately 1 MiB of host memory. */
+#define PPU_RASTER_MEMORY_MAX 65536
 /* key: beam position within the field, monotonic from its start at V=225
  * (0) through vblank (36 = V=261) and the visible lines (37 = V=0 ...). */
 /* Private targets, never passed to ppu_write: one committed low-table word
@@ -3202,14 +3207,23 @@ typedef struct {
   uint16_t low[0x100];
   uint8_t high[0x20];
 } PpuRasterOam;
+enum { kRasterCgram = 0x8000 };
+typedef struct { uint16_t key, address, val; } PpuRasterMemoryEntry;
+typedef struct {
+  uint16_t vram[0x8000];
+  uint16_t cgram[0x100];
+} PpuRasterMemory;
 typedef struct {
   uint8_t regs[PPU_SAVESTATE_REGS_SIZE];   /* inidisp..cgwsel at field start */
   PpuRasterOam oam;
+  PpuRasterMemory memory;
   uint8_t scrollPrev, scrollPrev2, m7prev;
   uint8_t hdmaen;
   int count;
   uint32_t dropped;
   PpuRasterEntry e[PPU_RASTER_MAX];
+  unsigned memory_count, memory_dropped;
+  PpuRasterMemoryEntry memory_e[PPU_RASTER_MEMORY_MAX];
 } PpuRasterField;
 static PpuRasterField s_field[2];
 static int s_raster_cur;             /* recording; the other is completed */
@@ -3218,6 +3232,7 @@ static int s_raster_have_completed;
 static int s_raster_rendering;
 static const PpuRasterField *s_raster_render;
 static int s_raster_next;
+static unsigned s_raster_memory_next;
 static uint8_t s_raster_hdmaen;
 static int s_raster_hdmaen_pending;
 static PpuDisplayObserver s_display_observer;
@@ -3235,27 +3250,34 @@ void ppu_rasterProbe(const Ppu *ppu, PpuRasterProbe *out) {
   memset(out, 0, sizeof(*out));
   out->current=s_raster_cur; out->armed=s_raster_armed;
   out->have_completed=s_raster_have_completed; out->rendering=s_raster_rendering;
-  out->cursor=s_raster_next;
+  out->cursor=(unsigned)s_raster_next+s_raster_memory_next;
   for(i=0;i<5;i++) {
     out->live[i]=((const uint8_t *)ppu)[off[i]];
     out->base[0][i]=s_field[0].regs[off[i]-offsetof(Ppu,inidisp)];
     out->base[1][i]=s_field[1].regs[off[i]-offsetof(Ppu,inidisp)];
   }
-  for(i=0;i<2;i++) { out->count[i]=s_field[i].count; out->dropped[i]=s_field[i].dropped; }
+  for(i=0;i<2;i++) {
+    out->count[i]=(unsigned)s_field[i].count+s_field[i].memory_count;
+    out->dropped[i]=s_field[i].dropped+s_field[i].memory_dropped;
+  }
 }
 void ppu_rasterStats(unsigned *count, unsigned *dropped, unsigned *next,
                      unsigned *completed) {
   const PpuRasterField *f = s_raster_rendering && s_raster_render
       ? s_raster_render : &s_field[s_raster_cur];
-  *count = (unsigned)f->count;
-  *dropped = f->dropped;
-  *next = (unsigned)s_raster_next;
+  *count = (unsigned)f->count + f->memory_count;
+  *dropped = f->dropped + f->memory_dropped;
+  *next = (unsigned)s_raster_next + s_raster_memory_next;
   *completed = (unsigned)s_raster_have_completed;
 }
 static struct {
   uint8_t regs[PPU_SAVESTATE_REGS_SIZE];
   PpuRasterOam oam;
-  uint32_t oamWriteCount;
+  PpuRasterMemory memory;
+  uint32_t oamWriteCount, vramWriteCount;
+  uint16_t vramPointer, vramReadBuffer;
+  uint8_t vramIncrementOnHigh, vramRemapMode, vramIncrement;
+  uint8_t cgramPointer, cgramSecondWrite, cgramBuffer;
   uint8_t scrollPrev, scrollPrev2, m7prev, mosaicStartLine;
   uint8_t oamAdr, oamInHigh, oamSecondWrite, oamBuffer;
 } s_raster_guest;
@@ -3296,15 +3318,27 @@ static void raster_restore_oam(Ppu *ppu, const PpuRasterOam *in) {
   memcpy(ppu->highOam, in->high, sizeof(in->high));
 }
 
+static void raster_save_memory(PpuRasterMemory *out, const Ppu *ppu) {
+  memcpy(out->vram, ppu->vram, sizeof(out->vram));
+  memcpy(out->cgram, ppu->cgram, sizeof(out->cgram));
+}
+
+static void raster_restore_memory(Ppu *ppu, const PpuRasterMemory *in) {
+  memcpy(ppu->vram, in->vram, sizeof(in->vram));
+  memcpy(ppu->cgram, in->cgram, sizeof(in->cgram));
+}
+
 static void raster_snapshot(PpuRasterField *f, const Ppu *ppu) {
   memcpy(f->regs, &ppu->inidisp, PPU_SAVESTATE_REGS_SIZE);
   raster_save_oam(&f->oam, ppu);
+  raster_save_memory(&f->memory, ppu);
   f->scrollPrev = ppu->scrollPrev;
   f->scrollPrev2 = ppu->scrollPrev2;
   f->m7prev = ppu->m7prev;
   f->hdmaen = g_snesrecomp_last_hdmaen;
   f->count = 0;
   f->dropped = 0;
+  f->memory_count = f->memory_dropped = 0;
 }
 
 void ppu_rasterBegin(Ppu *ppu) {
@@ -3336,6 +3370,7 @@ void ppu_rasterReset(void) {
   s_raster_have_completed = 0;
   s_raster_rendering = 0;
   s_raster_render = NULL;
+  s_raster_memory_next = 0;
   s_raster_hdmaen_pending = 0;
 }
 
@@ -3367,6 +3402,25 @@ static void raster_record_oam(Ppu *ppu, bool high, uint16_t index, uint16_t val)
                         g_snes->vPos, val);
 }
 
+static void raster_record_memory(Ppu *ppu, uint16_t address, uint16_t val) {
+  if (ppu != raster_machine_ppu() || !s_raster_armed || s_raster_rendering ||
+      g_ppu_wlog_src == kPpuWlogReplay)
+    return;
+  PpuRasterField *f = &s_field[s_raster_cur];
+  if (f->memory_count >= PPU_RASTER_MEMORY_MAX) {
+    f->memory_dropped++;
+    return;
+  }
+  PpuRasterMemoryEntry *e = &f->memory_e[f->memory_count++];
+  e->key = raster_key(g_snes->vPos);
+  e->address = address;
+  e->val = val;
+}
+
+void ppu_rasterRecordVram(Ppu *ppu, uint16_t address, uint16_t value) {
+  raster_record_memory(ppu, address & 0x7fff, value);
+}
+
 int ppu_rasterTakeHdmaen(uint8_t *out) {
   if (!s_raster_hdmaen_pending) return 0;
   s_raster_hdmaen_pending = 0;
@@ -3391,7 +3445,17 @@ void ppu_rasterRenderBegin(Ppu *ppu) {
    * visible raster walk (ApplyLine through 223) does not consume. */
   memcpy(s_raster_guest.regs, &ppu->inidisp, PPU_SAVESTATE_REGS_SIZE);
   raster_save_oam(&s_raster_guest.oam, ppu);
+  raster_save_memory(&s_raster_guest.memory, ppu);
   s_raster_guest.oamWriteCount = ppu->oamWriteCount;
+  s_raster_guest.vramWriteCount = ppu->vramWriteCount;
+  s_raster_guest.vramPointer = ppu->vramPointer;
+  s_raster_guest.vramReadBuffer = ppu->vramReadBuffer;
+  s_raster_guest.vramIncrementOnHigh = ppu->vramIncrementOnHigh;
+  s_raster_guest.vramRemapMode = ppu->vramRemapMode;
+  s_raster_guest.vramIncrement = ppu->vramIncrement;
+  s_raster_guest.cgramPointer = ppu->cgramPointer;
+  s_raster_guest.cgramSecondWrite = ppu->cgramSecondWrite;
+  s_raster_guest.cgramBuffer = ppu->cgramBuffer;
   s_raster_guest.scrollPrev = ppu->scrollPrev;
   s_raster_guest.scrollPrev2 = ppu->scrollPrev2;
   s_raster_guest.m7prev = ppu->m7prev;
@@ -3402,11 +3466,16 @@ void ppu_rasterRenderBegin(Ppu *ppu) {
   s_raster_guest.oamBuffer = ppu->oamBuffer;
   memcpy(&ppu->inidisp, f->regs, PPU_SAVESTATE_REGS_SIZE);
   raster_restore_oam(ppu, &f->oam);
+  /* Guest execution is parked during this walk. Preserve its live memories
+   * above and restore them at RenderEnd, including render-walk HDMA writes.
+   * An explicit renderVram binding remains owned by its caller. */
+  raster_restore_memory(ppu, &f->memory);
   ppu->scrollPrev = f->scrollPrev;
   ppu->scrollPrev2 = f->scrollPrev2;
   ppu->m7prev = f->m7prev;
   s_raster_render = f;
   s_raster_next = 0;
+  s_raster_memory_next = 0;
   s_raster_hdmaen_pending = 0;
   s_raster_rendering = 1;
   if (s_raster_probe_observer) s_raster_probe_observer(4);
@@ -3449,6 +3518,17 @@ void ppu_rasterApplyLine(Ppu *ppu, int line) {
     }
     s_raster_next++;
   }
+  /* These are decoded memory commits, independent of port addresses and
+   * latches. Applying both logs through the same line gives scroll, OAM,
+   * tile data and palettes the same field age without delaying guest work. */
+  while (s_raster_memory_next < f->memory_count &&
+         f->memory_e[s_raster_memory_next].key <= limit) {
+    const PpuRasterMemoryEntry *e = &f->memory_e[s_raster_memory_next++];
+    if (e->address < kRasterCgram)
+      ppu->vram[e->address] = e->val;
+    else
+      ppu->cgram[e->address - kRasterCgram] = e->val;
+  }
 }
 
 /* The render reconstructed the completed field. Restore the guest state
@@ -3463,7 +3543,17 @@ void ppu_rasterRenderEnd(Ppu *ppu) {
   s_raster_rendering = 0;
   memcpy(&ppu->inidisp, s_raster_guest.regs, PPU_SAVESTATE_REGS_SIZE);
   raster_restore_oam(ppu, &s_raster_guest.oam);
+  raster_restore_memory(ppu, &s_raster_guest.memory);
   ppu->oamWriteCount = s_raster_guest.oamWriteCount;
+  ppu->vramWriteCount = s_raster_guest.vramWriteCount;
+  ppu->vramPointer = s_raster_guest.vramPointer;
+  ppu->vramReadBuffer = s_raster_guest.vramReadBuffer;
+  ppu->vramIncrementOnHigh = s_raster_guest.vramIncrementOnHigh;
+  ppu->vramRemapMode = s_raster_guest.vramRemapMode;
+  ppu->vramIncrement = s_raster_guest.vramIncrement;
+  ppu->cgramPointer = s_raster_guest.cgramPointer;
+  ppu->cgramSecondWrite = s_raster_guest.cgramSecondWrite;
+  ppu->cgramBuffer = s_raster_guest.cgramBuffer;
   ppu->scrollPrev = s_raster_guest.scrollPrev;
   ppu->scrollPrev2 = s_raster_guest.scrollPrev2;
   ppu->m7prev = s_raster_guest.m7prev;
@@ -3489,11 +3579,14 @@ static int raster_dump_field(char *out, int cap, const char *name,
   memcpy(&bg1h, f->regs + RJ_OFF(hScroll), sizeof(bg1h));
   memcpy(&bg1v, f->regs + RJ_OFF(vScroll), sizeof(bg1v));
   pos += snprintf(out + pos, cap - pos,
-                  "\"%s\":{\"count\":%d,\"dropped\":%u,"
+                  "\"%s\":{\"count\":%u,\"dropped\":%u,"
+                  "\"memory_count\":%u,\"memory_dropped\":%u,"
                   "\"base\":{\"inidisp\":\"0x%02X\",\"tm\":\"0x%02X\","
                   "\"tmw\":\"0x%02X\",\"cgadsub\":\"0x%02X\","
                   "\"bg1h\":%u,\"bg1v\":%u},\"entries\":[",
-                  name, f->count, (unsigned)f->dropped,
+                  name, (unsigned)f->count + f->memory_count,
+                  f->dropped + f->memory_dropped,
+                  f->memory_count, f->memory_dropped,
                   f->regs[RJ_OFF(inidisp)], f->regs[RJ_OFF(screenEnabled)],
                   f->regs[RJ_OFF(screenWindowed)], f->regs[RJ_OFF(cgadsub)],
                   (unsigned)bg1h, (unsigned)bg1v);
@@ -3659,6 +3752,7 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
       // TODO: vram access during rendering (also cgram and oam)
       uint16_t vramAdr = ppu_getVramRemap(ppu);
       ppu->vram[vramAdr & 0x7fff] = (ppu->vram[vramAdr & 0x7fff] & 0xff00) | val;
+      ppu_rasterRecordVram(ppu, vramAdr, ppu->vram[vramAdr & 0x7fff]);
       ppu->vramWriteCount++;
       // $2118 == low byte of word; byte_addr = word << 1.
       debug_server_on_vram_write(((uint32_t)(vramAdr & 0x7fff) << 1), val);
@@ -3675,6 +3769,7 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
     case 0x19: {
       uint16_t vramAdr = ppu_getVramRemap(ppu);
       ppu->vram[vramAdr & 0x7fff] = (ppu->vram[vramAdr & 0x7fff] & 0x00ff) | (val << 8);
+      ppu_rasterRecordVram(ppu, vramAdr, ppu->vram[vramAdr & 0x7fff]);
       ppu->vramWriteCount++;
       // $2119 == high byte of word; byte_addr = (word << 1) + 1.
       debug_server_on_vram_write(((uint32_t)(vramAdr & 0x7fff) << 1) + 1, val);
@@ -3711,7 +3806,9 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
       if(!ppu->cgramSecondWrite) {
         ppu->cgramBuffer = val;
       } else {
-        ppu->cgram[ppu->cgramPointer++] = (val << 8) | ppu->cgramBuffer;
+        uint8_t index = ppu->cgramPointer++;
+        ppu->cgram[index] = (val << 8) | ppu->cgramBuffer;
+        raster_record_memory(ppu, (uint16_t)(kRasterCgram + index), ppu->cgram[index]);
       }
       ppu->cgramSecondWrite = !ppu->cgramSecondWrite;
       break;

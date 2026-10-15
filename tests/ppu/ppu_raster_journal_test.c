@@ -1,6 +1,6 @@
 /* ROM-free test of the raster journal (ppu.c): field cut by the beam, every
  * display register journaled, render restores the completed field and
- * RenderEnd restores the guest registers/latches and OAM saved before rendering.
+ * RenderEnd restores guest registers/latches, OAM, VRAM and palettes.
  * Modelled on Doom's frame:
  * vblank write, a split at line 22, a split at 199, and a CPU half that runs
  * past V=225 into the next field. */
@@ -164,6 +164,154 @@ static void test_oam_commit_and_boundary(void) {
   ppu_rasterRenderEnd(&p);
 }
 
+static void write_vram_at(uint16_t line, uint16_t address, uint16_t word) {
+  write_at(line, 0x15, 0x80);
+  write_at(line, 0x16, (uint8_t)address);
+  write_at(line, 0x17, (uint8_t)(address >> 8));
+  write_at(line, 0x18, (uint8_t)word);
+  write_at(line, 0x19, (uint8_t)(word >> 8));
+}
+
+static void test_pose_artwork_and_palette_timeline(void) {
+  static uint16_t guest_vram[0x8000], guest_cgram[0x100];
+  ppu_rasterReset();
+  ppu_reset(&p);
+  write_at(225, 0x0d, 100);
+  write_at(225, 0x0d, 0);
+  p.oam[0] = 0x2064;
+  p.oam[1] = 4; /* Old pose references tile 4. */
+  p.vram[4 * 16] = 0x0080;
+  p.cgram[0x81] = 0x1111;
+  ppu_rasterBegin(&p);
+  /* Legitimate visible-area tilemap upload must not be frozen until next field. */
+  write_vram_at(80, 0x20, 0x4567);
+  write_at(218, 0x02, 0);
+  write_at(218, 0x03, 0);
+  write_at(218, 0x04, 97);
+  write_at(218, 0x04, 0x20);
+  write_at(218, 0x04, 5);
+  write_at(218, 0x04, 0); /* Next pose references tile 5. */
+  write_vram_at(218, 4 * 16, 0); /* Live data would erase the old pose. */
+  write_vram_at(218, 5 * 16, 0xff00);
+  write_at(222, 0x21, 0x81);
+  write_at(222, 0x22, 0x22);
+  write_at(222, 0x22, 0x22);
+  s_snes.vPos = 225;
+  ppu_rasterFieldBoundary();
+  write_at(251, 0x0d, 103);
+  write_at(251, 0x0d, 0);
+  write_vram_at(251, 4 * 16, 0x3333); /* Belongs only to field B. */
+  /* Leave non-default and partially filled ports for exact guest restoration. */
+  write_at(252, 0x15, 0x8d);
+  write_at(252, 0x16, 0x34);
+  write_at(252, 0x17, 0x12);
+  write_at(252, 0x21, 0x82);
+  write_at(252, 0x22, 0x66);
+  const uint32_t guest_vram_writes = p.vramWriteCount;
+  const uint16_t guest_pointer = p.vramPointer, guest_read = p.vramReadBuffer;
+  memcpy(guest_vram, p.vram, sizeof(guest_vram));
+  memcpy(guest_cgram, p.cgram, sizeof(guest_cgram));
+  for (int pass = 0; pass < 2; pass++) {
+    ppu_rasterRenderBegin(&p);
+    ppu_rasterApplyLine(&p, 0);
+    CHECK((p.oam[0] & 255) + p.hScroll[0] == 200);
+    CHECK(p.oam[1] == 4 && PpuRenderVram(&p)[4 * 16] == 0x0080);
+    CHECK(PpuPixelColor(&p, 0x81, 0) == 0x1111);
+    ppu_rasterApplyLine(&p, 79);
+    CHECK(PpuRenderVram(&p)[0x20] == 0);
+    ppu_rasterApplyLine(&p, 80);
+    CHECK(PpuRenderVram(&p)[0x20] == 0x4567);
+    ppu_rasterApplyLine(&p, 217);
+    CHECK(p.oam[1] == 4 && PpuRenderVram(&p)[4 * 16] == 0x0080);
+    ppu_rasterApplyLine(&p, 218);
+    CHECK(p.oam[1] == 5 && PpuRenderVram(&p)[5 * 16] == 0xff00);
+    CHECK(PpuRenderVram(&p)[4 * 16] == 0);
+    CHECK(PpuPixelColor(&p, 0x81, 0) == 0x1111);
+    ppu_rasterApplyLine(&p, 222);
+    CHECK(PpuPixelColor(&p, 0x81, 0) == 0x2222);
+    CHECK(p.vramWriteCount == guest_vram_writes);
+    /* Render-walk HDMA uses ports too; its data/latches must not leak. */
+    write_vram_at(222, 0x123, 0xdead);
+    ppu_write(&p, 0x21, 0x81);
+    ppu_write(&p, 0x22, 0xad);
+    ppu_write(&p, 0x22, 0x0b);
+    ppu_rasterRenderEnd(&p);
+    CHECK(memcmp(guest_vram, p.vram, sizeof(guest_vram)) == 0);
+    CHECK(memcmp(guest_cgram, p.cgram, sizeof(guest_cgram)) == 0);
+    CHECK(p.vramWriteCount == guest_vram_writes);
+    CHECK(p.vramPointer == guest_pointer && p.vramReadBuffer == guest_read);
+    CHECK(p.vramIncrementOnHigh && p.vramIncrement == 32 && p.vramRemapMode == 3);
+    CHECK(p.cgramPointer == 0x82 && p.cgramSecondWrite && p.cgramBuffer == 0x66);
+  }
+  s_snes.vPos = 225;
+  ppu_rasterFieldBoundary();
+  ppu_rasterRenderBegin(&p);
+  ppu_rasterApplyLine(&p, 0);
+  CHECK((p.oam[0] & 255) + p.hScroll[0] == 200);
+  CHECK(p.oam[1] == 5 && PpuRenderVram(&p)[4 * 16] == 0x3333);
+  CHECK(PpuRenderVram(&p)[5 * 16] == 0xff00 && p.cgram[0x81] == 0x2222);
+  ppu_rasterRenderEnd(&p);
+}
+
+static void test_memory_commits_and_budget(void) {
+  ppu_rasterReset();
+  ppu_reset(&p);
+  p.vram[8] = 0x1234;
+  p.cgram[255] = 0x5678;
+  ppu_rasterBegin(&p);
+  write_at(10, 0x15, 0x84); /* VMAIN remap mode 1 maps logical word 1 to 8. */
+  write_at(10, 0x16, 1);
+  write_at(10, 0x17, 0);
+  write_at(10, 0x18, 0xab);
+  write_at(12, 0x19, 0xcd);
+  write_at(224, 0x21, 255);
+  write_at(224, 0x22, 0xef); /* CGRAM commits only on the second byte. */
+  s_snes.vPos = 225;
+  ppu_rasterFieldBoundary();
+  write_at(230, 0x22, 0x12);
+  ppu_rasterRenderBegin(&p);
+  ppu_rasterApplyLine(&p, 10);
+  CHECK(p.vram[8] == 0x12ab);
+  ppu_rasterApplyLine(&p, 12);
+  CHECK(p.vram[8] == 0xcdab);
+  ppu_rasterApplyLine(&p, 224);
+  CHECK(p.cgram[255] == 0x5678);
+  ppu_rasterRenderEnd(&p);
+  CHECK(p.cgram[255] == 0x12ef && p.cgramPointer == 0);
+  s_snes.vPos = 225;
+  ppu_rasterFieldBoundary();
+  ppu_rasterRenderBegin(&p);
+  ppu_rasterApplyLine(&p, 0);
+  CHECK(p.cgram[255] == 0x12ef);
+  ppu_rasterRenderEnd(&p);
+
+  /* Direct word writers use the public hook. Saturating bulk history must
+   * report loss without exhausting the register/OAM budget or changing guest. */
+  ppu_rasterReset();
+  ppu_reset(&p);
+  ppu_rasterBegin(&p);
+  s_snes.vPos = 10;
+  for (unsigned i = 0; i < 0x10000; i++) {
+    p.vram[i & 0x7fff] = (uint16_t)i;
+    ppu_rasterRecordVram(&p, (uint16_t)(i & 0x7fff), (uint16_t)i);
+  }
+  p.vram[0] = 0xf00d;
+  ppu_rasterRecordVram(&p, 0, 0xf00d);
+  write_at(12, 0x26, 0x42);
+  s_snes.vPos = 225;
+  ppu_rasterFieldBoundary();
+  ppu_rasterRenderBegin(&p);
+  ppu_rasterApplyLine(&p, 223);
+  {
+    unsigned count, dropped, next, completed;
+    ppu_rasterStats(&count, &dropped, &next, &completed);
+    CHECK(count == 0x10001 && dropped == 1 && next == count && completed);
+  }
+  CHECK(p.vram[0] == 0x8000 && p.window1left == 0x42);
+  ppu_rasterRenderEnd(&p);
+  CHECK(p.vram[0] == 0xf00d);
+}
+
 int main(void) {
   memset(&s_snes, 0, sizeof(s_snes));
   memset(&p, 0, sizeof(p));
@@ -187,7 +335,7 @@ int main(void) {
   write_at(22, 0x27, 0xEB);
   write_at(199, 0x00, 0x80);        /* bottom split */
   write_at(199, 0x26, 0xFF);
-  write_at(150, 0x18, 0x55);        /* VMDATA: an upload, never replayed */
+  write_at(150, 0x18, 0x55);        /* VMDATA: decoded memory history */
   /* The bottom split's DMA carries the CPU across V=225 ... */
   s_snes.vPos = 225;
   ppu_rasterFieldBoundary();
@@ -279,14 +427,19 @@ int main(void) {
 
   test_oam_field_timeline();
   test_oam_commit_and_boundary();
+  test_pose_artwork_and_palette_timeline();
+  test_memory_commits_and_budget();
 
   /* A machine reset disarms and does not restore stale OAM. */
   ppu_rasterReset();
   p.oam[0] = 0x7654;
+  p.vram[0] = 0x3210;
+  p.cgram[0] = 0x0123;
   write_at(50, 0x26, 0x77);
   ppu_rasterRenderBegin(&p);
   CHECK(p.window1left == 0x77);
   CHECK(p.oam[0] == 0x7654);
+  CHECK(p.vram[0] == 0x3210 && p.cgram[0] == 0x0123);
   ppu_rasterRenderEnd(&p);
 
   printf("ppu_raster_journal_test: ok\n");
