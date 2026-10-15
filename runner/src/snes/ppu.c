@@ -3158,12 +3158,17 @@ uint8_t ppu_read(Ppu* ppu, uint8_t adr) {
  * start instead, the writes made after the crossing were filed under the
  * field that had just ended, at lines it had already drawn.
  *
- * Every display register is journaled: $2100-$2133 except the data ports and
- * their address registers (VRAM $2115-$2119, CGRAM $2121/$2122, OAMDATA
- * $2104), which are uploads rather than per-line display state, plus HDMAEN
+ * Every display register is journaled: $2100-$2133 except the VRAM/CGRAM
+ * ports ($2115-$2119, $2121/$2122) and raw OAMDATA ($2104), plus HDMAEN
  * ($420C), which is handed back to the host because HDMA lives in the DMA
  * unit. The set used to be the five registers one title's handlers wrote;
  * the next title wrote a sixth and drew black.
+ * OAM is field history too: a late upload can prepare the next picture while
+ * the completed field still needs the old object coordinates. Keep its start
+ * image and journal committed words/high-table bytes, not raw port bytes.
+ * Decoded commits also account for reads or vblank relatching the OAM port.
+ * VRAM/CGRAM uploads retain their existing behavior; this is not a full PPU
+ * memory timeline or sub-scanline object evaluation model.
  *
  * Writes the render walk makes itself (its HDMA, and this replay) are not
  * journaled: they are the field being reconstructed, not new history. HDMA
@@ -3175,7 +3180,7 @@ uint8_t ppu_read(Ppu* ppu, uint8_t adr) {
  *   ppu_rasterRenderBegin(ppu)      before the render loop: restore the last
  *                                   completed field's baseline
  *   ppu_rasterApplyLine(ppu, line)  in the render loop, before ppu_runLine
- *   ppu_rasterRenderEnd(ppu)        after it: restore the guest register file
+ *   ppu_rasterRenderEnd(ppu)        after it: restore guest registers, OAM
  *                                   and write latches saved before render */
 int g_ppu_scanout_latch_bypass = 0;
 
@@ -3188,9 +3193,18 @@ void ppu_set_vram_write_log_hook(PpuVramWriteLogHook hook) {
 #define PPU_RASTER_MAX 4096
 /* key: beam position within the field, monotonic from its start at V=225
  * (0) through vblank (36 = V=261) and the visible lines (37 = V=0 ...). */
-typedef struct { uint16_t key; uint16_t reg; uint8_t val; } PpuRasterEntry;
+/* Private targets, never passed to ppu_write: one committed low-table word
+ * or high-table byte. Using the padded entry's last word keeps its size at
+ * six bytes and a full 544-byte upload costs 288 entries. */
+enum { kRasterOamLow = 0x8000, kRasterOamHigh = 0x8100 };
+typedef struct { uint16_t key, reg, val; } PpuRasterEntry;
+typedef struct {
+  uint16_t low[0x100];
+  uint8_t high[0x20];
+} PpuRasterOam;
 typedef struct {
   uint8_t regs[PPU_SAVESTATE_REGS_SIZE];   /* inidisp..cgwsel at field start */
+  PpuRasterOam oam;
   uint8_t scrollPrev, scrollPrev2, m7prev;
   uint8_t hdmaen;
   int count;
@@ -3240,6 +3254,8 @@ void ppu_rasterStats(unsigned *count, unsigned *dropped, unsigned *next,
 }
 static struct {
   uint8_t regs[PPU_SAVESTATE_REGS_SIZE];
+  PpuRasterOam oam;
+  uint32_t oamWriteCount;
   uint8_t scrollPrev, scrollPrev2, m7prev, mosaicStartLine;
   uint8_t oamAdr, oamInHigh, oamSecondWrite, oamBuffer;
 } s_raster_guest;
@@ -3270,8 +3286,19 @@ static int raster_reg_journaled(uint16_t reg) {
   }
 }
 
+static void raster_save_oam(PpuRasterOam *out, const Ppu *ppu) {
+  memcpy(out->low, ppu->oam, sizeof(out->low));
+  memcpy(out->high, ppu->highOam, sizeof(out->high));
+}
+
+static void raster_restore_oam(Ppu *ppu, const PpuRasterOam *in) {
+  memcpy(ppu->oam, in->low, sizeof(in->low));
+  memcpy(ppu->highOam, in->high, sizeof(in->high));
+}
+
 static void raster_snapshot(PpuRasterField *f, const Ppu *ppu) {
   memcpy(f->regs, &ppu->inidisp, PPU_SAVESTATE_REGS_SIZE);
+  raster_save_oam(&f->oam, ppu);
   f->scrollPrev = ppu->scrollPrev;
   f->scrollPrev2 = ppu->scrollPrev2;
   f->m7prev = ppu->m7prev;
@@ -3312,9 +3339,9 @@ void ppu_rasterReset(void) {
   s_raster_hdmaen_pending = 0;
 }
 
-void ppu_rasterRecord(uint16_t reg, uint16_t line, uint8_t val) {
+static void raster_record_entry(uint16_t reg, uint16_t line, uint16_t val) {
   PpuRasterField *f;
-  if (!s_raster_armed || s_raster_rendering || !raster_reg_journaled(reg))
+  if (!s_raster_armed || s_raster_rendering)
     return;
   if (g_ppu_wlog_src == kPpuWlogReplay)
     return;
@@ -3327,6 +3354,17 @@ void ppu_rasterRecord(uint16_t reg, uint16_t line, uint8_t val) {
   f->e[f->count].reg = reg;
   f->e[f->count].val = val;
   f->count++;
+}
+
+void ppu_rasterRecord(uint16_t reg, uint16_t line, uint8_t val) {
+  if (raster_reg_journaled(reg))
+    raster_record_entry(reg, line, val);
+}
+
+static void raster_record_oam(Ppu *ppu, bool high, uint16_t index, uint16_t val) {
+  if (ppu == raster_machine_ppu())
+    raster_record_entry((uint16_t)((high ? kRasterOamHigh : kRasterOamLow) + index),
+                        g_snes->vPos, val);
 }
 
 int ppu_rasterTakeHdmaen(uint8_t *out) {
@@ -3352,6 +3390,8 @@ void ppu_rasterRenderBegin(Ppu *ppu) {
    * state reached by the CPU, including late writes at line 224 which the
    * visible raster walk (ApplyLine through 223) does not consume. */
   memcpy(s_raster_guest.regs, &ppu->inidisp, PPU_SAVESTATE_REGS_SIZE);
+  raster_save_oam(&s_raster_guest.oam, ppu);
+  s_raster_guest.oamWriteCount = ppu->oamWriteCount;
   s_raster_guest.scrollPrev = ppu->scrollPrev;
   s_raster_guest.scrollPrev2 = ppu->scrollPrev2;
   s_raster_guest.m7prev = ppu->m7prev;
@@ -3361,6 +3401,7 @@ void ppu_rasterRenderBegin(Ppu *ppu) {
   s_raster_guest.oamSecondWrite = ppu->oamSecondWrite;
   s_raster_guest.oamBuffer = ppu->oamBuffer;
   memcpy(&ppu->inidisp, f->regs, PPU_SAVESTATE_REGS_SIZE);
+  raster_restore_oam(ppu, &f->oam);
   ppu->scrollPrev = f->scrollPrev;
   ppu->scrollPrev2 = f->scrollPrev2;
   ppu->m7prev = f->m7prev;
@@ -3390,15 +3431,21 @@ void ppu_rasterApplyLine(Ppu *ppu, int line) {
    * field's start, and handlers write the two bytes in pairs. */
   while (s_raster_next < f->count && f->e[s_raster_next].key <= limit) {
     const uint16_t reg = f->e[s_raster_next].reg;
-    const uint8_t val = f->e[s_raster_next].val;
-    if (reg == 0x420C) {
+    const uint16_t val = f->e[s_raster_next].val;
+    if (reg >= kRasterOamLow && reg < kRasterOamHigh) {
+      /* Reconstruct memory, not a new guest upload. Do not advance the port,
+       * upload counter, debug hooks or the journal itself. */
+      ppu->oam[reg - kRasterOamLow] = val;
+    } else if (reg >= kRasterOamHigh && reg < kRasterOamHigh + 0x20) {
+      ppu->highOam[reg - kRasterOamHigh] = (uint8_t)val;
+    } else if (reg == 0x420C) {
       /* Not ours to apply — HDMA lives in the DMA unit and enabling a channel
        * mid-frame also has to (re)start its table. Hand it to the host, which
        * owns the render loop and calls dma_initHdma/dma_doHdma. */
-      s_raster_hdmaen = val;
+      s_raster_hdmaen = (uint8_t)val;
       s_raster_hdmaen_pending = 1;
     } else {
-      raster_replay(ppu, reg, val);
+      raster_replay(ppu, reg, (uint8_t)val);
     }
     s_raster_next++;
   }
@@ -3415,6 +3462,8 @@ void ppu_rasterRenderEnd(Ppu *ppu) {
   if (s_raster_probe_observer) s_raster_probe_observer(5);
   s_raster_rendering = 0;
   memcpy(&ppu->inidisp, s_raster_guest.regs, PPU_SAVESTATE_REGS_SIZE);
+  raster_restore_oam(ppu, &s_raster_guest.oam);
+  ppu->oamWriteCount = s_raster_guest.oamWriteCount;
   ppu->scrollPrev = s_raster_guest.scrollPrev;
   ppu->scrollPrev2 = s_raster_guest.scrollPrev2;
   ppu->m7prev = s_raster_guest.m7prev;
@@ -3452,9 +3501,16 @@ static int raster_dump_field(char *out, int cap, const char *name,
   for (i = 0; i < f->count && pos < cap - 64; i++) {
     const unsigned key = f->e[i].key;
     const unsigned line = key < (262 - 225) ? key + 225 : key - (262 - 225);
-    pos += snprintf(out + pos, cap - pos,
-                    "%s{\"l\":%u,\"r\":\"0x%04X\",\"v\":\"0x%02X\"}",
-                    i ? "," : "", line, f->e[i].reg, f->e[i].val);
+    if (f->e[i].reg >= kRasterOamLow && f->e[i].reg < kRasterOamHigh + 0x20) {
+      /* OAM contents stay private; only the upload's position is diagnostic. */
+      pos += snprintf(out + pos, cap - pos,
+                      "%s{\"l\":%u,\"r\":\"0x2104\",\"oam\":true}",
+                      i ? "," : "", line);
+    } else {
+      pos += snprintf(out + pos, cap - pos,
+                      "%s{\"l\":%u,\"r\":\"0x%04X\",\"v\":\"0x%02X\"}",
+                      i ? "," : "", line, f->e[i].reg, f->e[i].val);
+    }
   }
   pos += snprintf(out + pos, cap - pos, "]}");
   return pos;
@@ -3509,6 +3565,7 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
       if(ppu->oamInHigh) {
         int hidx = ((ppu->oamAdr & 0xf) << 1) | ppu->oamSecondWrite;
         ppu->highOam[hidx] = val;
+        raster_record_oam(ppu, true, (uint16_t)hidx, val);
         ppu->oamWriteCount++;
         debug_server_on_oam_write(1, (uint16_t)hidx, (uint16_t)val);
         if(ppu->oamSecondWrite) {
@@ -3522,6 +3579,7 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
           uint16_t widx = ppu->oamAdr;
           uint16_t word = (uint16_t)((val << 8) | ppu->oamBuffer);
           ppu->oam[ppu->oamAdr++] = word;
+          raster_record_oam(ppu, false, widx, word);
           ppu->oamWriteCount++;
           debug_server_on_oam_write(0, widx, word);
           if(ppu->oamAdr == 0) ppu->oamInHigh = true;

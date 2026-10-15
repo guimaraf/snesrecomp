@@ -1,6 +1,6 @@
 /* ROM-free test of the raster journal (ppu.c): field cut by the beam, every
  * display register journaled, render restores the completed field and
- * RenderEnd restores the guest registers/latches saved before rendering.
+ * RenderEnd restores the guest registers/latches and OAM saved before rendering.
  * Modelled on Doom's frame:
  * vblank write, a split at line 22, a split at 199, and a CPU half that runs
  * past V=225 into the next field. */
@@ -32,6 +32,136 @@ static Ppu p;
 static void write_at(uint16_t line, uint8_t reg, uint8_t val) {
   s_snes.vPos = line;
   ppu_write(&p, reg, val);
+}
+
+static void test_oam_field_timeline(void) {
+  ppu_rasterReset();
+  ppu_reset(&p);
+  /* A stationary object at world X=200: old camera=100, new camera=103.
+   * The late upload prepares X=97 while this field still displays X=100. */
+  write_at(225, 0x0d, 100);
+  write_at(225, 0x0d, 0);
+  p.oam[0] = 0x2064;
+  p.oam[255] = 0x1234;
+  p.highOam[0] = 0x10;
+  p.highOam[31] = 0x22;
+  ppu_rasterBegin(&p);
+  write_at(218, 0x02, 0);
+  write_at(218, 0x03, 0);
+  /* All 512 low and 32 high bytes, including the automatic table wrap. */
+  for (unsigned i = 0; i < 256; i++) {
+    uint16_t word = i == 0 ? 0x2061 : (uint16_t)(0x4000 | i);
+    write_at(218, 0x04, (uint8_t)word);
+    write_at(218, 0x04, (uint8_t)(word >> 8));
+  }
+  for (unsigned i = 0; i < 32; i++)
+    write_at(218, 0x04, (uint8_t)(0x80 | i));
+  s_snes.vPos = 225;
+  ppu_rasterFieldBoundary();
+  write_at(251, 0x0d, 103);
+  write_at(251, 0x0d, 0);
+  /* Additional writes in field B must not leak into A, even after its split. */
+  write_at(252, 0x02, 5);
+  write_at(252, 0x03, 0);
+  write_at(252, 0x04, 0xef);
+  write_at(252, 0x04, 0xbe);
+  write_at(252, 0x02, 15);
+  write_at(252, 0x03, 1);
+  write_at(252, 0x04, 0xdd);
+  write_at(252, 0x04, 0xee);
+  const uint32_t guest_writes = p.oamWriteCount;
+  const uint8_t guest_adr = p.oamAdr;
+  const bool guest_high = p.oamInHigh, guest_second = p.oamSecondWrite;
+  const uint8_t guest_buffer = p.oamBuffer;
+  uint16_t guest_oam[256];
+  uint8_t guest_high_oam[32];
+  memcpy(guest_oam, p.oam, sizeof(guest_oam));
+  memcpy(guest_high_oam, p.highOam, sizeof(guest_high_oam));
+  {
+    char dump[32768];
+    ppu_rasterDebugDump(dump, sizeof(dump));
+    CHECK(strstr(dump, "\"oam\":true") != NULL);
+    CHECK(strstr(dump, "\"r\":\"0x8000\"") == NULL);
+    CHECK(strstr(dump, "\"v\":\"0x2061\"") == NULL);
+  }
+  /* Repeating a render neither overwrites history nor creates new uploads. */
+  for (int pass = 0; pass < 2; pass++) {
+    ppu_rasterRenderBegin(&p);
+    CHECK(p.oam[0] == 0x2064 && p.oam[255] == 0x1234);
+    CHECK(p.highOam[0] == 0x10 && p.highOam[31] == 0x22);
+    ppu_rasterApplyLine(&p, 0);
+    CHECK((p.oam[0] & 255) + p.hScroll[0] == 200);
+    ppu_rasterApplyLine(&p, 217);
+    CHECK(p.oam[0] == 0x2064 && p.oam[5] == 0);
+    ppu_rasterApplyLine(&p, 218);
+    CHECK(p.oam[0] == 0x2061 && p.oam[5] == 0x4005);
+    CHECK(p.oam[255] == 0x40ff && p.highOam[31] == 0x9f);
+    CHECK(p.hScroll[0] == 100 && p.oamWriteCount == guest_writes);
+    /* A render-walk OAM write must not leak into guest memory/counters. */
+    ppu_write(&p, 0x02, 0);
+    ppu_write(&p, 0x03, 0);
+    ppu_write(&p, 0x04, 0xaa);
+    ppu_write(&p, 0x04, 0xbb);
+    ppu_rasterRenderEnd(&p);
+    CHECK(p.hScroll[0] == 103 && p.oam[0] == 0x2061);
+    CHECK(p.oam[5] == 0xbeef && p.highOam[30] == 0xdd && p.highOam[31] == 0xee);
+    CHECK(p.oamWriteCount == guest_writes && p.oamAdr == guest_adr);
+    CHECK(p.oamInHigh == guest_high && p.oamSecondWrite == guest_second);
+    CHECK(p.oamBuffer == guest_buffer);
+    CHECK(memcmp(p.oam, guest_oam, sizeof(guest_oam)) == 0);
+    CHECK(memcmp(p.highOam, guest_high_oam, sizeof(guest_high_oam)) == 0);
+  }
+  /* The following field pairs the new coordinates with the new scroll. */
+  s_snes.vPos = 225;
+  ppu_rasterFieldBoundary();
+  ppu_rasterRenderBegin(&p);
+  ppu_rasterApplyLine(&p, 0);
+  CHECK((p.oam[0] & 255) + p.hScroll[0] == 200);
+  CHECK(p.oam[5] == 0xbeef && p.highOam[31] == 0xee);
+  CHECK(p.oamWriteCount == guest_writes);
+  ppu_rasterRenderEnd(&p);
+}
+
+static void test_oam_commit_and_boundary(void) {
+  ppu_rasterReset();
+  ppu_reset(&p);
+  p.oam[5] = 0x1234;
+  ppu_rasterBegin(&p);
+  write_at(10, 0x02, 5);
+  write_at(10, 0x03, 0);
+  write_at(10, 0x04, 0xaa); /* Only the port latch changes. */
+  write_at(12, 0x04, 0xbb); /* The word commits here. */
+  /* First frame: no completed field yet, so replay the recording field. */
+  ppu_rasterRenderBegin(&p);
+  ppu_rasterApplyLine(&p, 11);
+  CHECK(p.oam[5] == 0x1234);
+  ppu_rasterApplyLine(&p, 12);
+  CHECK(p.oam[5] == 0xbbaa);
+  ppu_rasterRenderEnd(&p);
+  write_at(224, 0x04, 0x77);
+  write_at(224, 0x04, 0x99); /* Outside the driver's visible replay window. */
+  write_at(224, 0x04, 0xcc); /* Half a word crossing the field boundary. */
+  s_snes.vPos = 225;
+  ppu_rasterFieldBoundary();
+  write_at(230, 0x04, 0xdd);
+  const uint32_t guest_writes = p.oamWriteCount;
+  ppu_rasterRenderBegin(&p);
+  ppu_rasterApplyLine(&p, 11);
+  CHECK(p.oam[5] == 0x1234);
+  ppu_rasterApplyLine(&p, 12);
+  CHECK(p.oam[5] == 0xbbaa);
+  ppu_rasterApplyLine(&p, 223);
+  CHECK(p.oam[6] == 0 && p.oam[7] == 0);
+  ppu_rasterRenderEnd(&p);
+  CHECK(p.oam[6] == 0x9977 && p.oam[7] == 0xddcc);
+  CHECK(p.oamAdr == 8 && !p.oamSecondWrite);
+  CHECK(p.oamWriteCount == guest_writes);
+  s_snes.vPos = 225;
+  ppu_rasterFieldBoundary();
+  ppu_rasterRenderBegin(&p);
+  ppu_rasterApplyLine(&p, 0);
+  CHECK(p.oam[6] == 0x9977 && p.oam[7] == 0xddcc);
+  ppu_rasterRenderEnd(&p);
 }
 
 int main(void) {
@@ -147,11 +277,16 @@ int main(void) {
     }
   }
 
-  /* A machine reset disarms. */
+  test_oam_field_timeline();
+  test_oam_commit_and_boundary();
+
+  /* A machine reset disarms and does not restore stale OAM. */
   ppu_rasterReset();
+  p.oam[0] = 0x7654;
   write_at(50, 0x26, 0x77);
   ppu_rasterRenderBegin(&p);
   CHECK(p.window1left == 0x77);
+  CHECK(p.oam[0] == 0x7654);
   ppu_rasterRenderEnd(&p);
 
   printf("ppu_raster_journal_test: ok\n");
