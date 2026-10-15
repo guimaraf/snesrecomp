@@ -379,12 +379,33 @@ static bool PresentationDecoupled(void) { return WantedPresentationHz(0) > 0; }
  * A decoupled presentation or an explicitly disabled frame delay paces
  * elsewhere and must not also wait on the driver. */
 static int VSyncInterval(void) {
+  /* The host loop also pumps the netplay barrier. A monitor refresh wait here
+   * can pace simulation differently on each peer, so online sessions always
+   * present without driver vsync. Keep the saved preference for offline play. */
+  if (g_netplay_session) return 0;
   if (PresentationDecoupled() || g_config.disable_frame_delay) return 0;
   switch (g_config.vsync) {
     case kSnesVSync_Off:      return 0;
     case kSnesVSync_Adaptive: return -1;
     default:                  return 1;
   }
+}
+
+/* Keep diagnostic output active while allowing the launcher to hide only the
+ * Windows console window. Other platforms control stdout/stderr themselves. */
+static void ConsoleLogSetVisible(bool visible) {
+#ifdef _WIN32
+  HWND console = GetConsoleWindow();
+  DWORD console_processes[2];
+  DWORD process_count = GetConsoleProcessList(
+      console_processes, (DWORD)(sizeof(console_processes) / sizeof(console_processes[0])));
+  /* A developer may run the game from an existing terminal. Never hide that
+   * shared terminal; this option owns only the game's private log console. */
+  if (console && process_count == 1)
+    ShowWindow(console, visible ? SW_SHOW : SW_HIDE);
+#else
+  (void)visible;
+#endif
 }
 
 static int WindowBaseWidth(int frame_w) {
@@ -2625,6 +2646,7 @@ static void LauncherSeed(RecompLauncherCSettings *ls, RecompLauncherCGameInfo *g
   ls->deadzone[0] = ls->deadzone[1] =
       (g_config.gamepad_deadzone * 100 + 32767 / 2) / 32767;
   ls->skip_launcher = g_config.skip_launcher;
+  ls->enable_log    = g_config.enable_log ? 1 : 0;
   ls->msu1_enabled  = 0;
   /* Display rows the framework host wires (see FrameBlendConfigure,
    * RendererApply, the vsync flags at presenter creation, and
@@ -2753,6 +2775,8 @@ static void LauncherCommit(const RecompLauncherCSettings *ls, const char *config
   g_config.enable_gamepad[1]   = ls->player_src[1] == 2;
   g_config.gamepad_deadzone    = (ls->deadzone[0] * 32767 + 50) / 100;
   g_config.skip_launcher       = ls->skip_launcher != 0;
+  g_config.enable_log          = ls->enable_log != 0;
+  ConsoleLogSetVisible(g_config.enable_log);
   g_config.frame_blend         = ls->frame_blend != 0;
   g_config.run_ahead           = ls->run_ahead;
   if (game->rewind_settings) {
@@ -2988,6 +3012,8 @@ static void RunInGameLauncher(bool *running, const char **exit_reason) {
 }
 
 int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **argv) {
+  /* Do not flash the console before the persisted preference is available. */
+  ConsoleLogSetVisible(false);
   if (!game || !game->game_info || !game->display_name) {
     fprintf(stderr, "snesrecomp_desktop_main: descriptor needs display_name and game_info\n");
     return 2;
@@ -3107,6 +3133,7 @@ int snesrecomp_desktop_main(const SnesDesktopHostGame *game, int argc, char **ar
       ParseConfigFile("config.local.ini");
     }
   }
+  ConsoleLogSetVisible(g_config.enable_log);
   /* Before after_config, so a port that wants to inspect the parsed rewind
    * settings sees the same opt-in the writer will honour. */
   if (game->rewind_settings) ConfigEnableRewindKeys();
@@ -3584,6 +3611,9 @@ error_reading:;
   host_report_breadcrumb("renderer initialized: %s",
       g_config.output_method == kOutputMethod_OpenGL ? "opengl" :
       g_config.output_method == kOutputMethod_SDLSoftware ? "sdl-software" : "sdl");
+  if (g_netplay_session)
+    host_report_breadcrumb(
+        "netplay: VSync disabled for session (effective interval=0; saved setting preserved)");
 
   g_audio_mutex = SDL_CreateMutex();
   if (!g_audio_mutex) Die("No mutex");

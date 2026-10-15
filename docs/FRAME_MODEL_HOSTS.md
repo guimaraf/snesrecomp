@@ -53,7 +53,12 @@ the host: a CPU half may legitimately run past V=225 (Doom DMAs its frame from
 line 199 into the next field's top border), and those writes belong to the
 next field. A host arms it with `ppu_rasterBegin`, and brackets its render loop
 with `ppu_rasterRenderBegin`, `ppu_rasterApplyLine` per line and
-`ppu_rasterRenderEnd`, which reapplies the writes made since the field ended.
+`ppu_rasterRenderEnd`, which restores the guest display-register file and write
+latches saved before rendering. Reapplying only the next field's journal is
+insufficient: writes at the completed field's tail (for example line 224 when
+the visible loop applies through line 223) must survive even though they do
+not affect the pixels already drawn. Render-walk register changes must not
+become the guest state from which the next field's baseline is captured.
 
 ## APU Pacing
 

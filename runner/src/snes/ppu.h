@@ -602,6 +602,25 @@ void ppu_rasterApplyLine(Ppu *ppu, int line);
 void ppu_rasterFieldBoundary(void);
 /* Disarm, for a machine rebuild (session reset). */
 void ppu_rasterReset(void);
+/* Optional read-only host observer: event 0=write before application,
+ * 1=field boundary. Includes bulk ports; never exports memory contents. */
+typedef void (*PpuDisplayObserver)(int event, uint16_t reg, uint8_t val);
+void ppu_set_display_observer(PpuDisplayObserver observer);
+/* Read-only bounded register metadata. State bytes: INIDISP, TM, TS, CGADSUB,
+ * CGWSEL. Slots are physical journal slots; current is the recording slot.
+ * Probe stages: 1/2=boundary-before/after, 3/4=render-begin-before/after,
+ * 5/6=render-end-before/after. Independent of PpuDisplayObserver. */
+typedef struct {
+  uint8_t live[5], base[2][5];
+  unsigned current, armed, have_completed, rendering, cursor;
+  unsigned count[2], dropped[2];
+} PpuRasterProbe;
+void ppu_rasterProbe(const Ppu *ppu, PpuRasterProbe *out);
+typedef void (*PpuRasterProbeObserver)(unsigned stage);
+void ppu_set_raster_probe_observer(PpuRasterProbeObserver observer);
+
+void ppu_rasterStats(unsigned *count, unsigned *dropped, unsigned *next,
+                     unsigned *completed);
 
 /* Scanout latch bypass — set by the debug server around render_inject so an
  * injected OAM/CGRAM state is rendered as given. A frame-model host that

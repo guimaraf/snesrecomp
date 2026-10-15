@@ -92,6 +92,9 @@ typedef struct Config {
   // Set from the launcher's dashboard checkbox. Force the launcher back with the
   // --launcher argument or by setting SkipLauncher = 0 in config.ini.
   bool skip_launcher;
+  /* Show the Windows console that receives stdout/stderr diagnostics.
+   * Defaults on so existing installs keep the current log-window behavior. */
+  bool enable_log;
   bool expose_coverage_mod;
   int coverage_capture; /* -1 absent: use Mods selection */
 

@@ -1,6 +1,7 @@
 /* ROM-free test of the raster journal (ppu.c): field cut by the beam, every
  * display register journaled, render restores the completed field and
- * RenderEnd puts back what the guest wrote since. Modelled on Doom's frame:
+ * RenderEnd restores the guest registers/latches saved before rendering.
+ * Modelled on Doom's frame:
  * vblank write, a split at line 22, a split at 199, and a CPU half that runs
  * past V=225 into the next field. */
 #include <stdio.h>
@@ -97,6 +98,54 @@ int main(void) {
   ppu_rasterApplyLine(&p, 10);
   CHECK(p.window1left == 0x20);
   ppu_rasterRenderEnd(&p);
+
+  /* ER-06: line 224 is beyond the driver's last ApplyLine(223). Those
+   * writes still belong to the guest and to the next field's baseline. */
+  ppu_rasterReset();
+  write_at(225, 0x2c, 0x04);
+  write_at(225, 0x2d, 0x01);
+  ppu_rasterBegin(&p);
+  write_at(224, 0x2c, 0x17);
+  write_at(224, 0x2d, 0x00);
+  write_at(224, 0x0d, 0x35);
+  write_at(224, 0x0d, 0x02);
+  write_at(224, 0x1b, 0x43);
+  write_at(224, 0x1b, 0x01);
+  p.mosaicStartLine = 7;
+  p.oamAdr = 0x42;
+  p.oamInHigh = true;
+  p.oamSecondWrite = true;
+  p.oamBuffer = 0x56;
+  s_snes.vPos = 225;
+  ppu_rasterFieldBoundary();
+  {
+    uint8_t guest_regs[PPU_SAVESTATE_REGS_SIZE];
+    const uint8_t scroll = p.scrollPrev, scroll2 = p.scrollPrev2, m7 = p.m7prev;
+    memcpy(guest_regs, &p.inidisp, sizeof(guest_regs));
+    ppu_rasterRenderBegin(&p);
+    ppu_rasterApplyLine(&p, 223);
+    CHECK(p.screenEnabled[0] == 0x04 && p.screenEnabled[1] == 0x01);
+    /* Render-walk writes must not leak their latch state to the guest. */
+    ppu_write(&p, 0x0d, 0x99);
+    ppu_write(&p, 0x1b, 0x88);
+    ppu_write(&p, 0x06, 0x11);
+    ppu_write(&p, 0x02, 0x11);
+    ppu_rasterRenderEnd(&p);
+    CHECK(memcmp(guest_regs, &p.inidisp, sizeof(guest_regs)) == 0);
+    CHECK(p.scrollPrev == scroll && p.scrollPrev2 == scroll2 && p.m7prev == m7);
+    CHECK(p.mosaicStartLine == 7);
+    CHECK(p.oamAdr == 0x42 && p.oamInHigh && p.oamSecondWrite && p.oamBuffer == 0x56);
+    /* Two more fields with no new mask writes must not alternate baselines. */
+    for (int field = 0; field < 2; field++) {
+      s_snes.vPos = 225;
+      ppu_rasterFieldBoundary();
+      ppu_rasterRenderBegin(&p);
+      ppu_rasterApplyLine(&p, 223);
+      CHECK(p.screenEnabled[0] == 0x17 && p.screenEnabled[1] == 0x00);
+      ppu_rasterRenderEnd(&p);
+      CHECK(memcmp(guest_regs, &p.inidisp, sizeof(guest_regs)) == 0);
+    }
+  }
 
   /* A machine reset disarms. */
   ppu_rasterReset();

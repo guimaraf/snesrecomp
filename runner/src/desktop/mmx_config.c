@@ -595,6 +595,8 @@ static bool HandleIniConfig(int section, const char *key, char *value) {
       return ParseBool(value, &g_config.enable_snes9x_oracle);
     } else if (StringEqualsNoCase(key, "SkipLauncher")) {
       return ParseBool(value, &g_config.skip_launcher);
+    } else if (StringEqualsNoCase(key, "EnableLog")) {
+      return ParseBool(value, &g_config.enable_log);
     }
   } else if (section == 6) {
     if (StringEqualsNoCase(key, "PlayerName")) {
@@ -676,6 +678,7 @@ void ParseConfigFile(const char *filename) {
   g_config.gamepad_deadzone = SNES_CONFIG_DEFAULT_DEADZONE;
   g_config.display_aspect = kSnesDisplayAspect_Crt4x3;
   g_config.skip_launcher = false;
+  g_config.enable_log = true;
   /* Rewind's built-in ring, matching snes_rewind.c's own defaults so a host
    * that opts into the launcher rows starts from what it already had. */
   g_config.rewind_enabled = true;
@@ -885,6 +888,7 @@ void WriteConfigFile(const char *filename) {
     { "GamepadMap", "EnableGamepad1" },
     { "GamepadMap", "EnableGamepad2" },
     { "General",    "SkipLauncher" },
+    { "General",    "EnableLog" },
     { "GamepadMap", "GamepadDeadzone" },
     { "Netplay",    "PlayerName" },
     { "Graphics",   "FrameBlend" },
@@ -921,6 +925,7 @@ void WriteConfigFile(const char *filename) {
   CfgSet(kvs, N, "GamepadMap", "EnableGamepad2", "%s",
          g_config.enable_gamepad[1] ? "true" : "false");
   CfgSet(kvs, N, "General", "SkipLauncher", "%d", g_config.skip_launcher ? 1 : 0);
+  CfgSet(kvs, N, "General", "EnableLog", "%d", g_config.enable_log ? 1 : 0);
   CfgSet(kvs, N, "GamepadMap", "GamepadDeadzone", "%d", g_config.gamepad_deadzone);
   CfgSet(kvs, N, "Netplay", "PlayerName", "%s", g_config.netplay_player_name);
   CfgSet(kvs, N, "Graphics", "FrameBlend", "%d", g_config.frame_blend ? 1 : 0);

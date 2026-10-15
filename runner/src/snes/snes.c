@@ -24,6 +24,12 @@
 #include "../ppu_dma_trace.h"
 
 int snes_frame_counter;
+static SnesBeamLineHook s_beam_line_hook;
+
+void snes_set_beam_line_hook(SnesBeamLineHook hook) {
+  s_beam_line_hook = hook;
+}
+
 static const double apuCyclesPerMaster = (32040 * 32) / (1364 * 262 * 60.0);
 
 bool snes_next_irq_master(const Snes *snes, uint64_t now, uint64_t *out) {
@@ -463,6 +469,7 @@ static uint32_t snes_advance_beam(Snes *snes, uint32_t clocks, bool check_irq) {
           h = 0; v++; if (v >= 262u) v = 0;
           if (v == 225u) { snes->rdnmiPending = true; ppu_rasterFieldBoundary(); }
           if (v == 0u) snes->rdnmiPending = false;
+          if (s_beam_line_hook) s_beam_line_hook(snes, (uint16_t)v);
         }
         snes->hPos = (uint16_t)h;
         snes->vPos = (uint16_t)v;
@@ -509,6 +516,7 @@ static uint32_t snes_advance_beam(Snes *snes, uint32_t clocks, bool check_irq) {
         }
         snes->dbgLatchedThisField = 0;
       }
+      if (s_beam_line_hook) s_beam_line_hook(snes, (uint16_t)v);
     }
   }
   snes->hPos = (uint16_t)h;

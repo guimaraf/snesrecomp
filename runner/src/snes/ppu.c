@@ -2292,6 +2292,11 @@ static void PpuDrawBackgrounds(Ppu *ppu, int y, bool sub) {
     if (ppu->lineHasSprites)
       PpuDrawSprites(ppu, y, sub, true);
 
+    if (snes_frame_counter == 1469 && y == 171) {
+      fprintf(stderr, "[BG y=171 f=1469 sub=%d] lineHasSprites=%d obj[60]=0x%04X bg[60]=0x%04X\n",
+              sub, ppu->lineHasSprites, ppu->objBuffer.data[60 + kPpuExtraLeftRight], ppu->bgBuffers[sub].data[60 + kPpuExtraLeftRight]);
+    }
+
     if (ppu->wsMode2CaptureLayer) {
       PpuCaptureBackground_4bpp(ppu, y, sub, 0);
       PpuCaptureBackground_4bpp(ppu, y, sub, 1);
@@ -2304,11 +2309,21 @@ static void PpuDrawBackgrounds(Ppu *ppu, int y, bool sub) {
         mosaic_size && PPU_mosaicEnabled(ppu, 0));
     PpuFinishBackgroundOverlay(ppu, y, sub, 0, layerbuf);
 
+    if (snes_frame_counter == 1469 && y == 171) {
+      fprintf(stderr, "[BG y=171 f=1469 sub=%d] after BG1: bg[60]=0x%04X\n",
+              sub, ppu->bgBuffers[sub].data[60 + kPpuExtraLeftRight]);
+    }
+
     layerbuf = PpuBeginBackgroundOverlay(ppu, y, sub, 1);
     PpuDrawBackground_4bpp_policy(
         ppu, layerbuf, y, sub, 1, 0xb100, 0x7100,
         mosaic_size && PPU_mosaicEnabled(ppu, 1));
     PpuFinishBackgroundOverlay(ppu, y, sub, 1, layerbuf);
+
+    if (snes_frame_counter == 1469 && y == 171) {
+      fprintf(stderr, "[BG y=171 f=1469 sub=%d] after BG2: bg[60]=0x%04X\n",
+              sub, ppu->bgBuffers[sub].data[60 + kPpuExtraLeftRight]);
+    }
 
     uint bg3prio = PPU_bg3priority(ppu) ? 0xf200 : 0x3200;
     layerbuf = PpuBeginBackgroundOverlay(ppu, y, sub, 2);
@@ -2865,6 +2880,19 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
     index += 2;
   }
 
+  if (snes_frame_counter == 1468 || snes_frame_counter == 1469 || snes_frame_counter == 1470) {
+    if (line == 170) {
+      fprintf(stderr, "[EVAL line=170 f=%d] spritesFound=%d objSize=%d obsel=0x%02X oamadd=0x%02X%02X\n",
+              snes_frame_counter, spritesFound, PPU_objSize(ppu), ppu->obsel, ppu->oamaddh, ppu->oamaddl);
+      for (int s = 0; s < spritesFound; s++) {
+        uint8_t idx = foundSprites[s];
+        fprintf(stderr, "   found[%d]: slot=%d x=%d y=%d sz=%d oam1=0x%04X\n",
+                s, idx >> 1, PpuDecodeOamX(ppu, idx), ppu->oam[idx] >> 8,
+                (ppu->highOam[idx >> 3] >> ((idx & 7) + 1)) & 1, ppu->oam[idx+1]);
+      }
+    }
+  }
+
   for(int i = spritesFound; i > 0; i--) {
     index = foundSprites[i - 1];
     uint8_t row = line - (ppu->oam[index] >> 8);
@@ -2902,6 +2930,10 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
                      (((oam1 & 0xf) + (usedCol >> 3)) & 0xf);
             const uint16 *addr = &PpuRenderVram(ppu)[(objAdr + usedTile * 16 + (row & 0x7)) & 0x7fff];
             uint32 plane = addr[0] | addr[8] << 16;
+            if ((snes_frame_counter == 1468 || snes_frame_counter == 1469 || snes_frame_counter == 1470) && line == 170) {
+              fprintf(stderr, "   [TILE slot=%d col=%d] row=%d usedTile=0x%02X a0=0x%04X a8=0x%04X plane=0x%08X\n",
+                      index >> 1, col, row, usedTile, addr[0], addr[8], plane);
+            }
             int px_left = IntMax(-(col + x + kPpuExtraLeftRight), 0);
             int px_right = IntMin(256 + kPpuExtraLeftRight - (col + x), 8);
             PpuZbufType *dst = ppu->objBuffer.data + col + x + px_left + kPpuExtraLeftRight;
@@ -3143,9 +3175,8 @@ uint8_t ppu_read(Ppu* ppu, uint8_t adr) {
  *   ppu_rasterRenderBegin(ppu)      before the render loop: restore the last
  *                                   completed field's baseline
  *   ppu_rasterApplyLine(ppu, line)  in the render loop, before ppu_runLine
- *   ppu_rasterRenderEnd(ppu)        after it: reapply the writes made since
- *                                   the field ended, so the guest resumes
- *                                   with the register file it last wrote */
+ *   ppu_rasterRenderEnd(ppu)        after it: restore the guest register file
+ *                                   and write latches saved before render */
 int g_ppu_scanout_latch_bypass = 0;
 
 static PpuVramWriteLogHook s_vram_write_log_hook;
@@ -3175,9 +3206,43 @@ static const PpuRasterField *s_raster_render;
 static int s_raster_next;
 static uint8_t s_raster_hdmaen;
 static int s_raster_hdmaen_pending;
+static PpuDisplayObserver s_display_observer;
+static PpuRasterProbeObserver s_raster_probe_observer;
+void ppu_set_raster_probe_observer(PpuRasterProbeObserver observer) {
+  s_raster_probe_observer=observer;
+}
+void ppu_set_display_observer(PpuDisplayObserver observer) {
+  s_display_observer = observer;
+}
+void ppu_rasterProbe(const Ppu *ppu, PpuRasterProbe *out) {
+  unsigned i;
+  const size_t off[5] = { offsetof(Ppu,inidisp), offsetof(Ppu,screenEnabled),
+    offsetof(Ppu,screenEnabled)+1, offsetof(Ppu,cgadsub), offsetof(Ppu,cgwsel) };
+  memset(out, 0, sizeof(*out));
+  out->current=s_raster_cur; out->armed=s_raster_armed;
+  out->have_completed=s_raster_have_completed; out->rendering=s_raster_rendering;
+  out->cursor=s_raster_next;
+  for(i=0;i<5;i++) {
+    out->live[i]=((const uint8_t *)ppu)[off[i]];
+    out->base[0][i]=s_field[0].regs[off[i]-offsetof(Ppu,inidisp)];
+    out->base[1][i]=s_field[1].regs[off[i]-offsetof(Ppu,inidisp)];
+  }
+  for(i=0;i<2;i++) { out->count[i]=s_field[i].count; out->dropped[i]=s_field[i].dropped; }
+}
+void ppu_rasterStats(unsigned *count, unsigned *dropped, unsigned *next,
+                     unsigned *completed) {
+  const PpuRasterField *f = s_raster_rendering && s_raster_render
+      ? s_raster_render : &s_field[s_raster_cur];
+  *count = (unsigned)f->count;
+  *dropped = f->dropped;
+  *next = (unsigned)s_raster_next;
+  *completed = (unsigned)s_raster_have_completed;
+}
 static struct {
+  uint8_t regs[PPU_SAVESTATE_REGS_SIZE];
+  uint8_t scrollPrev, scrollPrev2, m7prev, mosaicStartLine;
   uint8_t oamAdr, oamInHigh, oamSecondWrite, oamBuffer;
-} s_raster_port;
+} s_raster_guest;
 
 /* Only the machine's PPU journals: the debug server and a few tools run
  * ppu_write on scratch copies. */
@@ -3227,6 +3292,8 @@ void ppu_rasterBegin(Ppu *ppu) {
 }
 
 void ppu_rasterFieldBoundary(void) {
+  if (s_raster_probe_observer) s_raster_probe_observer(1);
+  if (s_display_observer) s_display_observer(1, 0, 0);
   Ppu *ppu = raster_machine_ppu();
   if (!s_raster_armed || !ppu)
     return;
@@ -3234,6 +3301,7 @@ void ppu_rasterFieldBoundary(void) {
   s_raster_cur ^= 1;
   s_raster_have_completed = 1;
   raster_snapshot(&s_field[s_raster_cur], ppu);
+  if (s_raster_probe_observer) s_raster_probe_observer(2);
 }
 
 void ppu_rasterReset(void) {
@@ -3275,14 +3343,23 @@ int ppu_rasterTakeHdmaen(uint8_t *out) {
 void ppu_rasterRenderBegin(Ppu *ppu) {
   const PpuRasterField *f;
   if (!s_raster_armed) return;
+  if (s_raster_probe_observer) s_raster_probe_observer(3);
   /* Before any field has completed (the first frame), the recording one is
    * all there is. */
   f = s_raster_have_completed ? &s_field[s_raster_cur ^ 1]
                               : &s_field[s_raster_cur];
-  s_raster_port.oamAdr = ppu->oamAdr;
-  s_raster_port.oamInHigh = ppu->oamInHigh;
-  s_raster_port.oamSecondWrite = ppu->oamSecondWrite;
-  s_raster_port.oamBuffer = ppu->oamBuffer;
+  /* Rendering rewinds display state, not guest execution. Keep the exact
+   * state reached by the CPU, including late writes at line 224 which the
+   * visible raster walk (ApplyLine through 223) does not consume. */
+  memcpy(s_raster_guest.regs, &ppu->inidisp, PPU_SAVESTATE_REGS_SIZE);
+  s_raster_guest.scrollPrev = ppu->scrollPrev;
+  s_raster_guest.scrollPrev2 = ppu->scrollPrev2;
+  s_raster_guest.m7prev = ppu->m7prev;
+  s_raster_guest.mosaicStartLine = ppu->mosaicStartLine;
+  s_raster_guest.oamAdr = ppu->oamAdr;
+  s_raster_guest.oamInHigh = ppu->oamInHigh;
+  s_raster_guest.oamSecondWrite = ppu->oamSecondWrite;
+  s_raster_guest.oamBuffer = ppu->oamBuffer;
   memcpy(&ppu->inidisp, f->regs, PPU_SAVESTATE_REGS_SIZE);
   ppu->scrollPrev = f->scrollPrev;
   ppu->scrollPrev2 = f->scrollPrev2;
@@ -3291,6 +3368,7 @@ void ppu_rasterRenderBegin(Ppu *ppu) {
   s_raster_next = 0;
   s_raster_hdmaen_pending = 0;
   s_raster_rendering = 1;
+  if (s_raster_probe_observer) s_raster_probe_observer(4);
 }
 
 static void raster_replay(Ppu *ppu, uint16_t reg, uint8_t val) {
@@ -3326,26 +3404,26 @@ void ppu_rasterApplyLine(Ppu *ppu, int line) {
   }
 }
 
-/* The render reconstructed the completed field. Writes the guest has made
- * since that field ended -- a CPU half that ran past V=225 -- are still in
- * the recording journal: put them back, so the guest resumes with the
- * register file it last wrote. The OAM port is the guest's, not display
- * state: an OAMADD replay must not move it. */
+/* The render reconstructed the completed field. Restore the guest state
+ * saved before that reconstruction, rather than replaying only the next
+ * field's entries over the render result. That missed the completed field's
+ * tail (e.g. line 224) and let two different baselines alternate indefinitely.
+ * Copying the saved registers/latches has no bus writes or replay side effects.
+ * Pixel output and journal entries remain those of the reconstructed field. */
 void ppu_rasterRenderEnd(Ppu *ppu) {
-  const PpuRasterField *f;
-  int i;
   if (!s_raster_armed || !s_raster_rendering) return;
+  if (s_raster_probe_observer) s_raster_probe_observer(5);
   s_raster_rendering = 0;
-  if (s_raster_have_completed) {
-    f = &s_field[s_raster_cur];
-    for (i = 0; i < f->count; i++)
-      if (f->e[i].reg != 0x420C)
-        raster_replay(ppu, f->e[i].reg, f->e[i].val);
-  }
-  ppu->oamAdr = s_raster_port.oamAdr;
-  ppu->oamInHigh = s_raster_port.oamInHigh;
-  ppu->oamSecondWrite = s_raster_port.oamSecondWrite;
-  ppu->oamBuffer = s_raster_port.oamBuffer;
+  memcpy(&ppu->inidisp, s_raster_guest.regs, PPU_SAVESTATE_REGS_SIZE);
+  ppu->scrollPrev = s_raster_guest.scrollPrev;
+  ppu->scrollPrev2 = s_raster_guest.scrollPrev2;
+  ppu->m7prev = s_raster_guest.m7prev;
+  ppu->mosaicStartLine = s_raster_guest.mosaicStartLine;
+  ppu->oamAdr = s_raster_guest.oamAdr;
+  ppu->oamInHigh = s_raster_guest.oamInHigh;
+  ppu->oamSecondWrite = s_raster_guest.oamSecondWrite;
+  ppu->oamBuffer = s_raster_guest.oamBuffer;
+  if (s_raster_probe_observer) s_raster_probe_observer(6);
 }
 
 /* Snapshot of the journal as the renderer will consume it, for the debug
@@ -3398,6 +3476,8 @@ int ppu_rasterDebugDump(char *out, int cap) {
 }
 
 void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
+  if (s_display_observer && ppu == raster_machine_ppu() && adr <= 0x33)
+    s_display_observer(0, (uint16_t)(0x2100u | adr), val);
   ppu_wlog_note(adr, val);
   /* Every path into the PPU -- CPU stores, DMA, beam HDMA -- is history the
    * raster journal must see; recording here rather than in one caller is

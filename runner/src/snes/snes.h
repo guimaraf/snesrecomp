@@ -10,6 +10,10 @@
 
 typedef struct Snes Snes;
 typedef void (*SnesMasterClockChargeHook)(Snes *snes, uint64_t clocks);
+/* Host observation only: called once when the beam enters a new scanline.
+ * The explicit line is authoritative; hPos/vPos are committed after the walk.
+ * Hooks are host policy and are not part of the guest savestate. */
+typedef void (*SnesBeamLineHook)(const Snes *snes, uint16_t line);
 typedef void (*SnesWramWriteLogHook)(uint32_t ram_off, uint8_t value,
                                      const char *via);
 
@@ -146,6 +150,7 @@ void snes_sync_master_clock(Snes *snes, uint64_t master_clock);
  * step that can jump over h=1024 and drop that line's HDMA transfer (SimCity
  * scenario view: every 4th scanline one line late, issue #63). */
 void snes_set_master_clock_charge_hook(SnesMasterClockChargeHook hook);
+void snes_set_beam_line_hook(SnesBeamLineHook hook);
 /* Notified on every direct WRAM store that bypasses cpu_write8/16 (WMDATA
  * $2180, snes_write's WRAM and mirror stores, i.e. DMA A-bus writes). */
 void snes_set_wram_write_log_hook(SnesWramWriteLogHook hook);
