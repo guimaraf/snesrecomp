@@ -246,9 +246,6 @@ void snes_beam_frame_driver_draw_ppu_frame_observed(
   snes_set_hdma_beam_enabled(g_snes, false);
   ppu_rasterRenderBegin(g_ppu);
   dma_initHdma(g_snes->dma);
-  /* Hardware's V=0 init also performs each channel's first transfer before
-   * any visible pixel. */
-  dma_primeHdmaFirstLine(g_snes->dma);
   for (line = 1; line <= 224; line++) {
     uint8_t hdmaen;
     /* A split is written in H-blank after its line is drawn, so the previous
@@ -256,11 +253,11 @@ void snes_beam_frame_driver_draw_ppu_frame_observed(
     ppu_rasterApplyLine(g_ppu, line - 1);
     if (ppu_rasterTakeHdmaen(&hdmaen))
       dma_startDma(g_snes->dma, hdmaen, true);
+    /* Apply this line's HDMA values before the PPU consumes its registers. */
+    dma_doHdma(g_snes->dma);
     ppu_runLine(g_ppu, line);
     if (observer)
       observer(g_ppu, (unsigned)line, context);
-    /* HDMA runs in the H-blank after this line; it lands on the next. */
-    dma_doHdma(g_snes->dma);
   }
   ppu_rasterRenderEnd(g_ppu);
 }
