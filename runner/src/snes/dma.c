@@ -15,6 +15,17 @@
 
 extern Ppu *g_ppu;
 static DmaVramNotifyHook g_vram_notify_hook;
+static DmaTraceObserver g_dma_trace_observer;
+
+void dma_set_trace_observer(DmaTraceObserver observer) {
+  g_dma_trace_observer = observer;
+}
+
+void dma_trace_register_write(Dma *dma, uint16_t address, uint8_t value) {
+  if (!g_dma_trace_observer || !dma) return;
+  if (address != 0x420c && (address < 0x4300 || address >= 0x4380)) return;
+  g_dma_trace_observer(kDmaTraceRegisterWrite, dma, address, value);
+}
 
 /* Debug logging gate: set SNESRECOMP_DMA_DEBUG=1 to enable the DMA config /
  * CGRAM / S-DD1 arm trace. Off by default — the trace fires for every DMA
@@ -253,6 +264,7 @@ void dma_write(Dma* dma, uint16_t adr, uint8_t val) {
       break;
     }
   }
+  dma_trace_register_write(dma, adr, val);
 }
 
 void dma_doDma(Dma* dma) {
@@ -371,6 +383,8 @@ static void dma_hdmaLoadDescriptor(Dma* dma, DmaChannel* ch) {
 }
 
 void dma_initHdma(Dma* dma) {
+  if (g_dma_trace_observer)
+    g_dma_trace_observer(kDmaTraceHdmaInitBefore, dma, 0, 0);
   for (int i = 0; i < 8; i++) {
     DmaChannel* ch = &dma->channel[i];
     if (!ch->hdmaActive) continue;
@@ -379,6 +393,8 @@ void dma_initHdma(Dma* dma) {
     dma_hdmaLoadDescriptor(dma, ch);
     ch->offIndex = 0;
   }
+  if (g_dma_trace_observer)
+    g_dma_trace_observer(kDmaTraceHdmaInitAfter, dma, 0, 0);
 }
 
 void dma_primeHdmaFirstLine(Dma* dma) {

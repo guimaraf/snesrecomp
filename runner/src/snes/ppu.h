@@ -605,6 +605,9 @@ void ppu_rasterRecordVram(Ppu *ppu, uint16_t address, uint16_t value);
 void ppu_rasterApplyLine(Ppu *ppu, int line);
 /* Called by the beam walk when it reaches V=225. */
 void ppu_rasterFieldBoundary(void);
+/* Frame-model HDMA must read the completed field's sources, not live tables
+ * prepared later. Capture at beam line 0, after that field's vblank work. */
+void ppu_rasterCaptureHdmaSources(void);
 /* Disarm, for a machine rebuild (session reset). */
 void ppu_rasterReset(void);
 /* Optional read-only host observer: event 0=write before application,
@@ -627,6 +630,14 @@ void ppu_set_raster_probe_observer(PpuRasterProbeObserver observer);
 
 void ppu_rasterStats(unsigned *count, unsigned *dropped, unsigned *next,
                      unsigned *completed);
+
+/* Passive metadata only: no addresses of host buffers or memory payload. */
+typedef struct {
+  uint64_t recording_field, consumed_field;
+  unsigned memory_count, memory_dropped, memory_next, hdma_sources_valid;
+} PpuRasterMemoryProbe;
+void ppu_rasterMemoryProbe(PpuRasterMemoryProbe *out);
+
 
 /* Scanout latch bypass — set by the debug server around render_inject so an
  * injected OAM/CGRAM state is rendered as given. A frame-model host that

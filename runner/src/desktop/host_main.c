@@ -4492,8 +4492,12 @@ static void HandleCommand(uint32 j, bool pressed) {
   }
 }
 
+/* Optional passive observer; only the game-window R key is exposed. */
+void (*g_host_r_key_observer)(int pressed, uint64_t counter) = NULL;
 static void HandleInput(int keyCode, int keyMod, bool pressed) {
   int j = FindCmdForSdlKey(keyCode, (SDL_Keymod)keyMod);
+  if (keyCode == SDLK_r && g_host_r_key_observer)
+    g_host_r_key_observer(pressed, SDL_GetPerformanceCounter());
   if (j != 0)
     HandleCommand(j, pressed);
 }

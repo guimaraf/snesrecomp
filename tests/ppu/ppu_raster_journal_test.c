@@ -28,6 +28,70 @@ void WsShadowOnVramWrite(uint16_t address, uint16_t value) { (void)address; (voi
 
 static Snes s_snes;
 static Ppu p;
+static void write_at(uint16_t line, uint8_t reg, uint8_t val);
+
+static void test_hdma_sources_follow_completed_field(void) {
+  static uint8_t ram[0x20000], live_ram[0x20000];
+  Dma dma = {0}, live_dma;
+  ppu_rasterReset();
+  ppu_reset(&p);
+  s_snes.ram = ram;
+  s_snes.dma = &dma;
+  dma.snes = &s_snes;
+  memset(ram, 0x35, sizeof(ram));
+  dma.channel[0].aAdr = 0x100;
+  dma.channel[0].hdmaActive = true;
+  dma.channel[0].bAdr = 0x26;
+  dma.hdmaPendingInit = 1;
+  ppu_rasterBegin(&p);
+  write_at(250, 0x23, 0x22);
+  ppu_rasterCaptureHdmaSources(); /* line-0 callback, field A */
+  /* Late guest work prepares a different table/configuration. */
+  memset(ram, 0xff, sizeof(ram));
+  dma.channel[0].aAdr = 0x200;
+  dma.channel[0].bAdr = 0x28;
+  dma.hdmaPendingInit = 0;
+  s_snes.vPos = 225;
+  ppu_rasterFieldBoundary();
+  write_at(247, 0x23, 0x88);
+  memcpy(live_ram, ram, sizeof(ram));
+  live_dma = dma;
+  for (int pass = 0; pass < 2; pass++) {
+    ppu_rasterRenderBegin(&p);
+    ppu_rasterApplyLine(&p, 0);
+    CHECK((p.windowsel & 0xff) == 0x22);
+    CHECK(ram[0x100] == 0x35 && ram[0x1ffff] == 0x35);
+    CHECK(dma.channel[0].aAdr == 0x100 && dma.channel[0].bAdr == 0x26);
+    CHECK(dma.hdmaPendingInit == 1 && dma.snes == &s_snes);
+    /* The walk may advance tables or even write WRAM; neither leaks. */
+    ram[0x100] = 0x7e;
+    dma.channel[0].aAdr = 0x7777;
+    dma.dmaTimer = 999;
+    ppu_rasterRenderEnd(&p);
+    CHECK(memcmp(ram, live_ram, sizeof(ram)) == 0);
+    CHECK(memcmp(&dma, &live_dma, sizeof(dma)) == 0);
+    CHECK((p.windowsel & 0xff) == 0x88);
+  }
+  /* The other journal slot receives its own line-0 sources. */
+  ppu_rasterCaptureHdmaSources();
+  ram[0x100] = 0x19;
+  dma.channel[0].aAdr = 0x300;
+  s_snes.vPos = 225;
+  ppu_rasterFieldBoundary();
+  ppu_rasterRenderBegin(&p);
+  ppu_rasterApplyLine(&p, 0);
+  CHECK((p.windowsel & 0xff) == 0x88);
+  CHECK(ram[0x100] == 0xff && dma.channel[0].aAdr == 0x200);
+  ppu_rasterRenderEnd(&p);
+  CHECK(ram[0x100] == 0x19 && dma.channel[0].aAdr == 0x300);
+  ppu_rasterReset();
+  ram[0x100] = 0x42;
+  ppu_rasterRenderBegin(&p);
+  ppu_rasterRenderEnd(&p);
+  CHECK(ram[0x100] == 0x42);
+  s_snes.ram = NULL;
+  s_snes.dma = NULL;
+}
 
 static void write_at(uint16_t line, uint8_t reg, uint8_t val) {
   s_snes.vPos = line;
@@ -429,6 +493,7 @@ int main(void) {
   test_oam_commit_and_boundary();
   test_pose_artwork_and_palette_timeline();
   test_memory_commits_and_budget();
+  test_hdma_sources_follow_completed_field();
 
   /* A machine reset disarms and does not restore stale OAM. */
   ppu_rasterReset();

@@ -13,6 +13,27 @@ bool g_fail;
 static uint8_t bus[0x1000000];
 static uint8_t bbus[0x100];
 static unsigned bbus_writes;
+static struct {
+    unsigned register_writes, init_before, init_after;
+    uint16_t last_address;
+    uint8_t last_value;
+    DmaChannel before, after;
+} trace_probe;
+
+static void trace_dma(DmaTraceKind kind, const Dma *dma,
+                      uint16_t address, uint8_t value) {
+    if (kind == kDmaTraceRegisterWrite) {
+        trace_probe.register_writes++;
+        trace_probe.last_address = address;
+        trace_probe.last_value = value;
+    } else if (kind == kDmaTraceHdmaInitBefore) {
+        trace_probe.init_before++;
+        trace_probe.before = dma->channel[0];
+    } else if (kind == kDmaTraceHdmaInitAfter) {
+        trace_probe.init_after++;
+        trace_probe.after = dma->channel[0];
+    }
+}
 
 static int check(bool condition, const char *message) {
     if (!condition) fprintf(stderr, "FAIL: %s\n", message);
@@ -217,12 +238,54 @@ static int test_mid_frame_enable_disable(void) {
     return failures;
 }
 
+static int test_trace_observer(void) {
+    Snes snes = {0};
+    Dma *dma = dma_init(&snes);
+    int failures = 0;
+    if (!dma) return 1;
+    snes.dma = dma;
+    dma_reset(dma);
+    clear_bus();
+    memset(&trace_probe, 0, sizeof trace_probe);
+    bus[0x808000] = 0x81;
+
+    dma_set_trace_observer(trace_dma);
+    dma_write(dma, 0x4300, 0x00);
+    dma_write(dma, 0x4301, 0x26);
+    dma_write(dma, 0x4302, 0x00);
+    dma_write(dma, 0x4303, 0x80);
+    dma_write(dma, 0x4304, 0x80);
+    dma_startDma(dma, 0x01, true);
+    dma_trace_register_write(dma, 0x420c, 0x01);
+    dma_initHdma(dma);
+    dma_set_trace_observer(NULL);
+
+    failures += check(trace_probe.register_writes == 6,
+                      "trace reports five channel writes and the HDMA mask write");
+    failures += check(trace_probe.last_address == 0x420c &&
+                      trace_probe.last_value == 0x01,
+                      "trace records the HDMA enable register and value");
+    failures += check(trace_probe.init_before == 1 && trace_probe.init_after == 1,
+                      "trace brackets one HDMA frame initialization");
+    failures += check(trace_probe.before.aAdr == 0x8000 &&
+                      trace_probe.before.tableAdr == 0x8000,
+                      "pre-init snapshot retains the programmed table pointer");
+    failures += check(trace_probe.after.tableAdr == 0x8001 &&
+                      trace_probe.after.repCount == 0x81 &&
+                      !trace_probe.after.terminated,
+                      "post-init snapshot contains the loaded descriptor state");
+
+    dma_free(dma);
+    return failures;
+}
+
 int main(void) {
     int failures = 0;
     failures += test_direct_hdma();
     failures += test_indirect_hdma();
     failures += test_repeat_skip_hdma();
     failures += test_mid_frame_enable_disable();
+    failures += test_trace_observer();
     if (failures) return 1;
     puts("hdma_test: ok");
     return 0;

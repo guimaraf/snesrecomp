@@ -3222,10 +3222,17 @@ typedef struct {
   int count;
   uint32_t dropped;
   PpuRasterEntry e[PPU_RASTER_MAX];
+  uint64_t serial; /* diagnostic field identity, never guest state */
   unsigned memory_count, memory_dropped;
   PpuRasterMemoryEntry memory_e[PPU_RASTER_MEMORY_MAX];
+  /* Internal render history only; never serialized or exported. A full WRAM
+   * image covers direct/indirect HDMA and low-bank WRAM mirrors uniformly. */
+  uint8_t hdma_wram[0x20000];
+  Dma hdma_dma;
+  bool hdma_sources_valid;
 } PpuRasterField;
 static PpuRasterField s_field[2];
+static uint64_t s_raster_field_serial;
 static int s_raster_cur;             /* recording; the other is completed */
 static int s_raster_armed;
 static int s_raster_have_completed;
@@ -3270,6 +3277,16 @@ void ppu_rasterStats(unsigned *count, unsigned *dropped, unsigned *next,
   *next = (unsigned)s_raster_next + s_raster_memory_next;
   *completed = (unsigned)s_raster_have_completed;
 }
+void ppu_rasterMemoryProbe(PpuRasterMemoryProbe *out) {
+  const PpuRasterField *f = s_raster_rendering && s_raster_render
+      ? s_raster_render : &s_field[s_raster_cur];
+  out->recording_field=s_field[s_raster_cur].serial;
+  out->consumed_field=f->serial;
+  out->memory_count=f->memory_count;
+  out->memory_dropped=f->memory_dropped;
+  out->memory_next=s_raster_rendering?s_raster_memory_next:0;
+  out->hdma_sources_valid=f->hdma_sources_valid;
+}
 static struct {
   uint8_t regs[PPU_SAVESTATE_REGS_SIZE];
   PpuRasterOam oam;
@@ -3280,6 +3297,9 @@ static struct {
   uint8_t cgramPointer, cgramSecondWrite, cgramBuffer;
   uint8_t scrollPrev, scrollPrev2, m7prev, mosaicStartLine;
   uint8_t oamAdr, oamInHigh, oamSecondWrite, oamBuffer;
+  uint8_t hdma_wram[0x20000];
+  Dma hdma_dma;
+  bool hdma_sources_saved;
 } s_raster_guest;
 
 /* Only the machine's PPU journals: the debug server and a few tools run
@@ -3329,6 +3349,7 @@ static void raster_restore_memory(Ppu *ppu, const PpuRasterMemory *in) {
 }
 
 static void raster_snapshot(PpuRasterField *f, const Ppu *ppu) {
+  f->serial = ++s_raster_field_serial;
   memcpy(f->regs, &ppu->inidisp, PPU_SAVESTATE_REGS_SIZE);
   raster_save_oam(&f->oam, ppu);
   raster_save_memory(&f->memory, ppu);
@@ -3339,6 +3360,16 @@ static void raster_snapshot(PpuRasterField *f, const Ppu *ppu) {
   f->count = 0;
   f->dropped = 0;
   f->memory_count = f->memory_dropped = 0;
+  f->hdma_sources_valid = false;
+}
+
+void ppu_rasterCaptureHdmaSources(void) {
+  if (!s_raster_armed || s_raster_rendering || !g_snes ||
+      !g_snes->ram || !g_snes->dma) return;
+  PpuRasterField *f = &s_field[s_raster_cur];
+  memcpy(f->hdma_wram, g_snes->ram, sizeof(f->hdma_wram));
+  f->hdma_dma = *g_snes->dma;
+  f->hdma_sources_valid = true;
 }
 
 void ppu_rasterBegin(Ppu *ppu) {
@@ -3464,6 +3495,15 @@ void ppu_rasterRenderBegin(Ppu *ppu) {
   s_raster_guest.oamInHigh = ppu->oamInHigh;
   s_raster_guest.oamSecondWrite = ppu->oamSecondWrite;
   s_raster_guest.oamBuffer = ppu->oamBuffer;
+  s_raster_guest.hdma_sources_saved = f->hdma_sources_valid &&
+      g_snes && g_snes->ram && g_snes->dma;
+  if (s_raster_guest.hdma_sources_saved) {
+    memcpy(s_raster_guest.hdma_wram, g_snes->ram,
+           sizeof(s_raster_guest.hdma_wram));
+    s_raster_guest.hdma_dma = *g_snes->dma;
+    memcpy(g_snes->ram, f->hdma_wram, sizeof(f->hdma_wram));
+    *g_snes->dma = f->hdma_dma;
+  }
   memcpy(&ppu->inidisp, f->regs, PPU_SAVESTATE_REGS_SIZE);
   raster_restore_oam(ppu, &f->oam);
   /* Guest execution is parked during this walk. Preserve its live memories
@@ -3562,6 +3602,12 @@ void ppu_rasterRenderEnd(Ppu *ppu) {
   ppu->oamInHigh = s_raster_guest.oamInHigh;
   ppu->oamSecondWrite = s_raster_guest.oamSecondWrite;
   ppu->oamBuffer = s_raster_guest.oamBuffer;
+  if (s_raster_guest.hdma_sources_saved) {
+    memcpy(g_snes->ram, s_raster_guest.hdma_wram,
+           sizeof(s_raster_guest.hdma_wram));
+    *g_snes->dma = s_raster_guest.hdma_dma;
+    s_raster_guest.hdma_sources_saved = false;
+  }
   if (s_raster_probe_observer) s_raster_probe_observer(6);
 }
 

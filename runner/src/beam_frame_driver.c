@@ -236,8 +236,34 @@ void snes_beam_frame_driver_draw_ppu_frame(void) {
   snes_beam_frame_driver_draw_ppu_frame_observed(NULL, NULL);
 }
 
+/* Which VOFS ports will this HDMA slot actually write? Descriptor reloads
+ * and channels holding a value do not create a new deferred write. */
+static unsigned bfd_hdma_vofs_writes(const Dma *dma) {
+  static const uint8_t offsets[8][4] = {
+    {0,0,0,0},{0,1,0,1},{0,0,0,0},{0,0,1,1},
+    {0,1,2,3},{0,1,0,1},{0,0,0,0},{0,0,1,1}
+  };
+  static const uint8_t lengths[8] = {1,2,2,4,4,4,2,4};
+  unsigned channel, mask=0;
+  for(channel=0;channel<8;channel++) {
+    const DmaChannel *ch=&dma->channel[channel];
+    unsigned byte;
+    if(!ch->hdmaActive || ch->terminated || !ch->doTransfer ||
+       (dma_hdma_pending_init_get(dma)&(1u<<channel))) continue;
+    for(byte=0;byte<lengths[ch->mode&7];byte++) {
+      unsigned port=(ch->bAdr+offsets[ch->mode&7][byte])&255;
+      if(port>=0x0e && port<=0x14 && !(port&1))
+        mask|=1u<<((port-0x0e)/2);
+    }
+  }
+  return mask;
+}
 void snes_beam_frame_driver_draw_ppu_frame_observed(
     SnesBeamRasterObserver *observer, void *context) {
+  snes_beam_frame_driver_draw_ppu_frame_observed_deferred_vofs(observer,context,0);
+}
+void snes_beam_frame_driver_draw_ppu_frame_observed_deferred_vofs(
+    SnesBeamRasterObserver *observer, void *context, unsigned layer_mask) {
   int line;
 
   /* The field's register state as of its start, then each line's journal
@@ -245,19 +271,39 @@ void snes_beam_frame_driver_draw_ppu_frame_observed(
    * the beam must not also step it from inside guest register writes. */
   snes_set_hdma_beam_enabled(g_snes, false);
   ppu_rasterRenderBegin(g_ppu);
+  /* Vblank register/HDMAEN writes belong before HDMA initialization. The
+   * journal cursor makes the first loop iteration's ApplyLine(0) a no-op. */
+  ppu_rasterApplyLine(g_ppu, 0);
+  {
+    uint8_t hdmaen;
+    if (ppu_rasterTakeHdmaen(&hdmaen))
+      dma_startDma(g_snes->dma, hdmaen, true);
+  }
   dma_initHdma(g_snes->dma);
   for (line = 1; line <= 224; line++) {
     uint8_t hdmaen;
+    uint16_t before_vofs[4], next_vofs[4];
+    unsigned deferred, layer;
     /* A split is written in H-blank after its line is drawn, so the previous
      * line's entries take effect on this one. */
     ppu_rasterApplyLine(g_ppu, line - 1);
     if (ppu_rasterTakeHdmaen(&hdmaen))
       dma_startDma(g_snes->dma, hdmaen, true);
     /* Apply this line's HDMA values before the PPU consumes its registers. */
+    deferred=layer_mask ? bfd_hdma_vofs_writes(g_snes->dma)&layer_mask : 0;
+    for(layer=0;layer<4;layer++) before_vofs[layer]=g_ppu->vScroll[layer];
     dma_doHdma(g_snes->dma);
+    for(layer=0;layer<4;layer++) {
+      next_vofs[layer]=g_ppu->vScroll[layer];
+      if(deferred&(1u<<layer)) g_ppu->vScroll[layer]=before_vofs[layer];
+    }
     ppu_runLine(g_ppu, line);
     if (observer)
       observer(g_ppu, (unsigned)line, context);
+    /* Preserve the actual HDMA port/latch/channel result for the next line.
+     * RenderEnd still restores the exact pre-walk guest state. */
+    for(layer=0;layer<4;layer++)
+      if(deferred&(1u<<layer)) g_ppu->vScroll[layer]=next_vofs[layer];
   }
   ppu_rasterRenderEnd(g_ppu);
 }

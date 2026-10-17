@@ -10,6 +10,17 @@
 
 typedef struct Dma Dma;
 
+typedef enum DmaTraceKind {
+  kDmaTraceRegisterWrite = 0,
+  kDmaTraceHdmaInitBefore = 1,
+  kDmaTraceHdmaInitAfter = 2
+} DmaTraceKind;
+typedef void (*DmaTraceObserver)(DmaTraceKind kind, const Dma *dma,
+                                 uint16_t address, uint8_t value);
+void dma_set_trace_observer(DmaTraceObserver observer);
+/* Called for guest writes to $420C and $4300-$437F. Instrumentation only. */
+void dma_trace_register_write(Dma *dma, uint16_t address, uint8_t value);
+
 typedef void (*DmaVramNotifyHook)(uint8_t aBank, uint16_t aAdr,
                                   uint16_t vmadd, uint16_t size);
 void dma_set_vram_notify_hook(DmaVramNotifyHook hook);

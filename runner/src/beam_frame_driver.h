@@ -26,6 +26,14 @@ struct Ppu;
 typedef void SnesBeamRasterObserver(const struct Ppu *ppu, unsigned line, void *context);
 void snes_beam_frame_driver_draw_ppu_frame_observed(
     SnesBeamRasterObserver *observer, void *context);
+/* Opt-in candidate for ports investigating vertical HDMA phase: selected
+ * tiled BG VOFS writes are consumed one scanline later. No global scroll
+ * bias, extra HDMA transfer, guest mutation or persistent state. Default
+ * entry points retain their established behavior. layer_mask bit 0 = BG1.
+ * This is not a claim about universal SNES hardware timing. */
+void snes_beam_frame_driver_draw_ppu_frame_observed_deferred_vofs(
+    SnesBeamRasterObserver *observer, void *context, unsigned layer_mask);
+
 /* Forget the booted machine: the next frame starts from the reset vector. */
 void snes_beam_frame_driver_reset(void);
 

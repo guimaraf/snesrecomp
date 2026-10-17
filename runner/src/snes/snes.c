@@ -468,7 +468,10 @@ static uint32_t snes_advance_beam(Snes *snes, uint32_t clocks, bool check_irq) {
         if (h >= 1364u) {
           h = 0; v++; if (v >= 262u) v = 0;
           if (v == 225u) { snes->rdnmiPending = true; ppu_rasterFieldBoundary(); }
-          if (v == 0u) snes->rdnmiPending = false;
+          if (v == 0u) {
+            snes->rdnmiPending = false;
+            if (snes->hdmaBeamOff) ppu_rasterCaptureHdmaSources();
+          }
           if (s_beam_line_hook) s_beam_line_hook(snes, (uint16_t)v);
         }
         snes->hPos = (uint16_t)h;
@@ -504,6 +507,7 @@ static uint32_t snes_advance_beam(Snes *snes, uint32_t clocks, bool check_irq) {
       if (v >= 262u) {
         v = 0;
         snes->rdnmiPending = false;
+        if (snes->hdmaBeamOff) ppu_rasterCaptureHdmaSources();
         if (check_irq && !snes->hdmaBeamOff)
           dma_initHdma(snes->dma);
         /* End of field. Armed the whole way round and nothing latched means
@@ -899,6 +903,7 @@ void snes_writeReg(Snes* snes, uint16_t adr, uint8_t val) {
        * mask once at render time never sees them. */
       ppu_rasterRecord(0x420C, snes->vPos, val);
       dma_startDma(snes->dma, val, true);
+      dma_trace_register_write(snes->dma, 0x420c, val);
       break;
     }
     default: {
