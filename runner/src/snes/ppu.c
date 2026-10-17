@@ -1408,9 +1408,9 @@ static void PpuCaptureBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer) {
 }
 
 /* Modes 2/4/6 use BG3's tilemap as per-column scroll overrides for the
- * displayed layers.  Mode 2 (the Star Fox attract/game perspective screens)
- * has separate horizontal and vertical rows: BG3VOFS-1 selects the horizontal
- * row and BG3VOFS+7 the vertical row.  Bit 13 enables BG1, bit 14 enables BG2.
+ * displayed layers. Mode 2 has separate horizontal and vertical rows:
+ * BG3VOFS selects the horizontal row and BG3VOFS+8 the vertical row.
+ * Bit 13 enables BG1, bit 14 enables BG2.
  * The first visible tile column cannot be offset on hardware. */
 static void PpuDrawBackground_4bpp_opt(Ppu *ppu, uint y, bool sub, uint layer,
                                       PpuZbufType zhi, PpuZbufType zlo) {
@@ -1445,7 +1445,7 @@ static void PpuDrawBackground_4bpp_opt(Ppu *ppu, uint y, bool sub, uint layer,
   const unsigned hscroll = ppu->hScroll[layer];
   const unsigned vscroll = ppu->vScroll[layer];
   const unsigned opt_hscroll = ppu->hScroll[2];
-  const unsigned opt_vscroll = ppu->vScroll[2] - 1u;
+  const unsigned opt_vscroll = ppu->vScroll[2];
   const int opt_hrow = (opt_vscroll & opt_coord_mask) >> opt_shift;
   const int opt_vrow = ((opt_vscroll + 8) & opt_coord_mask) >> opt_shift;
   const uint16 enable = (uint16)(0x2000u << layer);
@@ -1466,18 +1466,19 @@ static void PpuDrawBackground_4bpp_opt(Ppu *ppu, uint y, bool sub, uint layer,
       const int source_screen_x = screen_x + sample_bias;
       unsigned hoffset = hscroll;
       unsigned voffset = vscroll;
-      if (source_screen_x < 8 - (int)(hscroll & 7)) {
+      const int column = (source_screen_x + (int)(hscroll & 7)) >> 3;
+      if (column <= 0) {
         /* The SNES cannot apply OPT to the leftmost source-tile column. */
       } else {
         const unsigned opt_pos =
-            (opt_hscroll + (unsigned)source_screen_x - 1) & opt_coord_mask;
+            (opt_hscroll + (unsigned)(column - 1) * 8u) & opt_coord_mask;
         const int opt_x = opt_pos >> opt_shift;
         const uint16 hcell = PpuReadTilemapEntry(ppu, 2, opt_x, opt_hrow);
         const uint16 vcell = PpuReadTilemapEntry(ppu, 2, opt_x, opt_vrow);
         if (hcell & enable)
-          hoffset = (hcell & ~7) | (hscroll & 7);
+          hoffset = (hcell & 0x3f8u) | (hscroll & 7);
         if (vcell & enable)
-          voffset = (uint16)(vcell + 1);
+          voffset = vcell & 0x3ffu;
       }
 
       const unsigned sx =

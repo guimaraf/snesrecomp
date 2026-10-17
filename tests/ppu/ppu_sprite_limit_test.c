@@ -170,12 +170,69 @@ static void setup_halved_subscreen_bg(Ppu *ppu) {
         ppu->vram[0x400 + col] = (uint16_t)((col % 15) + 1);
 }
 
+/* ER-09: distinct BG3 rows catch horizontal offsets consumed as vertical
+ * ones. Compare both renderers using synthetic graphics only, including the
+ * first partial column, nonzero table scroll, both BGs and 16x16 tiles. */
+static int test_mode2_offset_rows(Ppu *ppu) {
+    static const unsigned scrolls[] = {0, 1, 3, 7, 8, 13, 31, 255};
+    static const unsigned table_scrolls[] = {0, 7, 8, 127, 128, 255};
+    uint32_t pixels[2][256];
+    for (unsigned layer = 0; layer < 2; layer++) {
+        for (unsigned big = 0; big < 4; big++) {
+            for (unsigned hi = 0; hi < sizeof(scrolls)/sizeof(scrolls[0]); hi++) {
+                for (unsigned vi = 0; vi < sizeof(table_scrolls)/sizeof(table_scrolls[0]); vi++) {
+                    ppu_reset(ppu);
+                    ppu->inidisp = 15;
+                    ppu->bgmode = (uint8_t)(2 | ((big & 1) ? (0x10 << layer) : 0) |
+                                            ((big & 2) ? 0x40 : 0));
+                    ppu->screenEnabled[0] = (uint8_t)(1u << layer);
+                    ppu->bgXsc[0] = 0x20;
+                    ppu->bgXsc[1] = 0x24;
+                    ppu->bgXsc[2] = 0x30;
+                    ppu->hScroll[layer] = (uint16_t)scrolls[hi];
+                    ppu->vScroll[layer] = 780;
+                    ppu->hScroll[2] = (uint16_t)(vi & 1 ? 5 : 0);
+                    ppu->vScroll[2] = (uint16_t)table_scrolls[vi];
+                    for (unsigned color = 1; color < 16; color++)
+                        ppu->cgram[color] = (uint16_t)(color | ((color * 2) << 5));
+                    for (unsigned tile = 0; tile < 64; tile++)
+                        fill_solid_4bpp_tile(ppu, (uint16_t)(tile * 16), (uint8_t)(tile % 15 + 1));
+                    for (unsigned row = 0; row < 32; row++) {
+                        for (unsigned col = 0; col < 32; col++) {
+                            ppu->vram[0x2000 + row * 32 + col] =
+                            ppu->vram[0x2400 + row * 32 + col] =
+                                (uint16_t)((row * 5 + col * 3) % 32);
+                            /* Some columns retain base scroll; every table row
+                             * differs so off-by-one row selection is observable. */
+                            ppu->vram[0x3000 + row * 32 + col] =
+                                (uint16_t)((col % 3 ? (0x2000u << layer) : 0) |
+                                           ((row * 23 + col * 11) & 1023));
+                        }
+                    }
+                    for (unsigned flags = 0; flags < 2; flags++) {
+                        PpuBeginDrawing(ppu, (uint8_t *)pixels[flags], sizeof(pixels[flags]), flags);
+                        ppu_runLine(ppu, 0);
+                        ppu_runLine(ppu, 1);
+                    }
+                    if (memcmp(pixels[0], pixels[1], sizeof(pixels[0]))) {
+                        fprintf(stderr, "FAIL Mode2 OPT layer=%u big=%u h=%u table_v=%u\n",
+                                layer, big, scrolls[hi], table_scrolls[vi]);
+                        return 1;
+                    }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
 int main(void) {
     enum { kPitch = kPpuXPixels * 4 };
     uint8_t pixels[kPitch];
     Ppu *ppu = ppu_init();
     int failures = 0;
     if (!ppu) return 2;
+    failures += test_mode2_offset_rows(ppu);
     /* Presentation VRAM changes scanout in both renderers, but never CPU
      * reads/writes, the real tile memory, or the default-off picture. */
     for (unsigned flags = 0; flags <= 1; flags++) {
